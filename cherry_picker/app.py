@@ -1,62 +1,22 @@
-#!/usr/bin/env python3
-"""Cherry Picker - a Qt app for cherry-picking commits between branches of a GitHub repo.
-
-Usage:  python3 cherry_picker.py [owner/repo | URL]
-
-The repository is cloned into ~/.cache/cherry-picker/repos/ and all work happens
-in that clone, so your own checkouts are never touched.
-
-For the native Plasma look the app runs on the system Qt, using Fedora's PySide6 unpacked
-into .pyside/ (see pyside_local.py; nothing is installed or layered). Only a PySide6 built
-for the system Qt can load Plasma's widget style, colour scheme and KDE integration.
-"""
+"""The Qt main window. Import this only after cherry_picker.pyside.activate() has run."""
 import base64
 import html
-import os
 import shlex
 import sys
 import threading
-from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-SYSTEM_PY = "/usr/bin/python3"
-VENV_PY = HERE / ".venv" / "bin" / "python"
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
+                           QKeySequence, QSyntaxHighlighter, QTextCharFormat)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter,
+                               QDockWidget, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+                               QMenu, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
+                               QStackedWidget, QStyle, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
-
-def _restart_with(python):
-    os.environ["CHERRY_PICKER_REEXEC"] = "1"
-    os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
-
-
-# The Fedora PySide6 is built for the system Python, so switch to it (e.g. from Homebrew's python3).
-if sys.prefix != "/usr" and not os.environ.get("CHERRY_PICKER_REEXEC") and os.path.exists(SYSTEM_PY):
-    _restart_with(SYSTEM_PY)
-
-sys.path.insert(0, str(HERE))
-try:  # system-wide PySide6 if there is one, else the unpacked Fedora one
-    import PySide6  # noqa: F401
-except ModuleNotFoundError:
-    import pyside_local
-    pyside_local.activate()
-
-try:
-    from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal, Slot
-    from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
-                               QKeySequence, QSyntaxHighlighter, QTextCharFormat)
-    from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter,
-                                   QDockWidget, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-                                   QMenu, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
-                                   QStackedWidget, QStyle, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
-                                   QVBoxLayout, QWidget)
-except ModuleNotFoundError:
-    if VENV_PY.exists() and Path(sys.prefix).resolve() != (HERE / ".venv").resolve():
-        _restart_with(VENV_PY)
-    sys.exit("PySide6 could not be loaded. Fetch Fedora's build for your system Qt with:\n"
-             f"  /usr/bin/python3 {HERE}/pyside_local.py")
-
-from cpcore import (COMMIT_LIMIT, GitError, Repo, branch_name, editor_args, editor_icon_path,  # noqa: E402
-                    installed_editors,
-                    launch, load_config, pr_from_subject, save_config)
+from . import __version__
+from .core import (COMMIT_LIMIT, GitError, Repo, branch_name, editor_args, editor_icon_path, installed_editors,
+                   launch, load_config, pr_from_subject, save_config)
 
 COL_CHECK, COL_SHA, COL_SUBJECT, COL_PR, COL_AUTHOR, COL_DATE = range(6)
 
@@ -570,7 +530,7 @@ class Window(QMainWindow):
             try:
                 res = fn()
             except Exception as e:  # noqa: BLE001
-                self.bridge.call.emit(lambda: finish(None, e))
+                self.bridge.call.emit(lambda err=e: finish(None, err))  # `e` is cleared after the block
             else:
                 self.bridge.call.emit(lambda: finish(res, None))
         threading.Thread(target=work, daemon=True).start()
@@ -1019,16 +979,13 @@ class Window(QMainWindow):
             QDesktopServices.openUrl(QUrl(url))
 
 
-def main():
+def run(initial_repo=None):
     app = QApplication([sys.argv[0]])
     app.setApplicationName("cherry-picker")
     app.setApplicationDisplayName("Cherry Picker")
+    app.setApplicationVersion(__version__)
     app.setDesktopFileName("cherry-picker")  # lets Plasma match the window to the launcher and its icon
     app.setWindowIcon(icon("vcs-merge-request", "git", "applications-development"))
-    win = Window(sys.argv[1] if len(sys.argv) > 1 else None)
+    win = Window(initial_repo)
     win.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+    return app.exec()

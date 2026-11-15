@@ -1,4 +1,4 @@
-"""Git / GitHub backend shared by the Cherry Picker front ends (no GUI imports here)."""
+"""Git / GitHub backend and settings (no GUI imports here)."""
 import datetime
 import json
 import os
@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "cherry-picker"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "cherry-picker"
 CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "cherry-picker" / "config.json"
 COMMIT_LIMIT = 1000
@@ -153,6 +154,10 @@ class Repo:
     def start_branch(self, target, branch):
         if self.run(["check-ref-format", "--branch", branch], check=False, quiet=True).returncode:
             raise GitError(f"“{branch}” is not a valid branch name.")
+        if self.run(["var", "GIT_COMMITTER_IDENT"], check=False, quiet=True).returncode:
+            raise GitError("Git doesn't know who you are, so it can't make commits. Set your name and email:\n"
+                           '  git config --global user.name "Your Name"\n'
+                           "  git config --global user.email you@example.com")
         if self.in_pick():
             self.run(["cherry-pick", "--abort"], check=False)
         self.run(["checkout", "-f", "-B", branch, f"origin/{target}"])
@@ -172,11 +177,16 @@ class Repo:
         if p.returncode == 0:
             return "ok" if self.head() != before else "dropped"
         if self.in_pick():
-            if not self.conflicts():  # stopped but nothing conflicting -> became empty
+            if self.conflicts():
+                return "conflict"
+            if self.nothing_staged():  # stopped because the changes are already on the branch
                 self.run(["cherry-pick", "--skip"])
                 return "dropped"
-            return "conflict"
+            self.run(["cherry-pick", "--abort"], check=False)  # e.g. the commit itself failed
         raise GitError(f"Cherry-pick of {sha[:10]} failed:\n{(p.err or p.out).strip()}")
+
+    def nothing_staged(self):
+        return self.run(["diff", "--cached", "--quiet"], check=False, quiet=True).returncode == 0
 
     def conflicts(self):
         return [f for f in self.out(["diff", "--name-only", "--diff-filter=U", "-z"]).split("\0") if f]
@@ -205,7 +215,7 @@ class Repo:
         before = self.out(["rev-parse", "HEAD"]).strip()
         p = self.run(["cherry-pick", "--continue"], check=False)
         if p.returncode:
-            if self.in_pick() and not self.conflicts():  # resolution produced no changes
+            if self.in_pick() and not self.conflicts() and self.nothing_staged():  # resolution left no changes
                 self.run(["cherry-pick", "--skip"])
                 return "dropped"
             raise GitError(f"cherry-pick --continue failed:\n{(p.err or p.out).strip()}")

@@ -1,11 +1,11 @@
 """Use Fedora's PySide6 without installing or layering it.
 
 The python3-pyside6 / python3-shiboken6 RPMs that match the system Qt are downloaded with
-`dnf download` (as your user), signature-checked with `rpm -K` and unpacked into .pyside/
-next to this file. Because they are built against the system Qt, the app gets the real
+`dnf download` (as your user), signature-checked with `rpm -K` and unpacked into
+~/.local/share/cherry-picker/pyside/. Because they are built against the system Qt, the app gets the real
 Plasma integration: your widget style (Breeze/Union), colour scheme, icons and KDE dialogs.
 
-Run `python3 pyside_local.py` to (re)fetch by hand; delete .pyside/ to remove it.
+`cherry-picker --setup-qt` (re)fetches it by hand; deleting that folder removes it.
 """
 import ctypes
 import glob
@@ -18,7 +18,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent / ".pyside"
+from .core import DATA_DIR
+
+ROOT = DATA_DIR / "pyside"
 PACKAGES = ("python3-pyside6", "python3-shiboken6")
 
 
@@ -76,6 +78,7 @@ def install(log=lambda s: print(s, file=sys.stderr)):
             cpio.stdin.close()
             if cpio.wait():
                 raise RuntimeError(f"could not unpack {Path(rpm).name}")
+        ROOT.parent.mkdir(parents=True, exist_ok=True)
         if ROOT.exists():
             shutil.rmtree(ROOT)
         shutil.move(str(new), ROOT)
@@ -109,9 +112,3 @@ def activate(auto_install=True):
     sys.path[:0] = site
     return True
 
-
-if __name__ == "__main__":
-    try:
-        install()
-    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
-        sys.exit(f"Failed: {e}")
