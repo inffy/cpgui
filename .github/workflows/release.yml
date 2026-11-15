@@ -1,15 +1,11 @@
 name: Release
 
-# Builds cherry-picker.pyz and publishes it as a GitHub release:
-#  - every push to main (e.g. a merged pull request) releases v0.1.<build number>,
-#    except when only Markdown files (README etc.) changed - they aren't part of the app
-#  - pushing a tag like v0.2.0 releases exactly that version (GitHub doesn't apply path
-#    filters to tag pushes, so tags always release)
+# Pushing a tag like v0.2.0 builds cherry-picker.pyz and publishes it as release v0.2.0:
+#   git tag -a v0.2.0 -m "Cherry Picker 0.2.0" && git push origin v0.2.0
+# Ordinary pushes and merges don't release.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-    paths-ignore: ["**.md"]
 
 permissions:
   contents: write
@@ -24,18 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pick the version
-        id: version
-        run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            tag="v0.1.${{ github.run_number }}"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
       - name: Build cherry-picker.pyz
-        run: python3 build.py "${{ steps.version.outputs.tag }}"
+        run: python3 build.py "$GITHUB_REF_NAME"
 
       - name: Check that it runs
         run: python3 dist/cherry-picker.pyz --version
@@ -43,7 +29,7 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists - uploading the build to it"
