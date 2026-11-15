@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Cherry Picker
+Comment=Cherry-pick commits between branches of a GitHub repository
+Exec=python3 /var/home/juha/Downloads/cherry-picker/cherry_picker.py
+Icon=vcs-merge-request
+Terminal=false
+Categories=Development;RevisionControl;
