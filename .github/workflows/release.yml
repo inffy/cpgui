@@ -1,12 +1,15 @@
 name: Release
 
 # Builds cherry-picker.pyz and publishes it as a GitHub release:
-#  - every push to main (e.g. a merged pull request) releases v0.1.<build number>
-#  - pushing a tag like v0.2.0 releases exactly that version
+#  - every push to main (e.g. a merged pull request) releases v0.1.<build number>,
+#    except when only Markdown files (README etc.) changed - they aren't part of the app
+#  - pushing a tag like v0.2.0 releases exactly that version (GitHub doesn't apply path
+#    filters to tag pushes, so tags always release)
 on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore: ["**.md"]
 
 permissions:
   contents: write
