@@ -1,530 +1,562 @@
 #!/usr/bin/env python3
-"""Cherry Picker - a GTK4 app for cherry-picking commits between branches of a GitHub repo.
+"""Cherry Picker - a Qt app for cherry-picking commits between branches of a GitHub repo.
 
 Usage:  python3 cherry_picker.py [owner/repo | URL]
 
 The repository is cloned into ~/.cache/cherry-picker/repos/ and all work happens
 in that clone, so your own checkouts are never touched.
+
+For the native Plasma look the app runs on the system Qt, using Fedora's PySide6 unpacked
+into .pyside/ (see pyside_local.py; nothing is installed or layered). Only a PySide6 built
+for the system Qt can load Plasma's widget style, colour scheme and KDE integration.
 """
-import datetime
-import json
+import base64
+import html
 import os
-import re
 import shlex
-import subprocess
 import sys
 import threading
-import urllib.parse
 from pathlib import Path
 
-import gi
-
-gi.require_version("Gtk", "4.0")
-gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
-
-APP_ID = "io.github.cherrypicker.CherryPicker"
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "cherry-picker"
-CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "cherry-picker" / "config.json"
-COMMIT_LIMIT = 1000
-DIFF_LIMIT = 300_000
-PICKED_RE = re.compile(r"cherry picked from commit ([0-9a-f]{40})")
-
-CSS = """
-.sha { font-family: monospace; opacity: 0.7; }
-.meta { font-size: smaller; opacity: 0.7; }
-.badge { font-size: smaller; padding: 1px 8px; border-radius: 9px;
-         background: alpha(currentColor, 0.12); }
-.applied { opacity: 0.55; }
-.bar { padding: 10px; border-radius: 8px; }
-.conflict-bar { background: alpha(#e5a50a, 0.22); }
-.result-bar { background: alpha(#26a269, 0.20); }
-.section-title { font-weight: bold; }
-"""
+HERE = Path(__file__).resolve().parent
+SYSTEM_PY = "/usr/bin/python3"
+VENV_PY = HERE / ".venv" / "bin" / "python"
 
 
-# --------------------------------------------------------------------------- git backend
-
-class GitError(Exception):
-    pass
-
-
-def parse_repo(text):
-    """Return (clone_url, github_slug_or_None, cache_dir_name)."""
-    text = text.strip()
-    m = re.match(r"^(?:https?://github\.com/|git@github\.com:)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", text)
-    looks_remote = text.startswith(("http", "git@"))
-    if m and (looks_remote or not os.path.exists(text)):
-        owner, name = m.groups()
-        slug = f"{owner}/{name}"
-        url = text if text.startswith("git@") else f"https://github.com/{slug}.git"
-        return url, slug, f"{owner}__{name}"
-    if not text:
-        raise GitError("Enter a repository first (e.g. owner/repo).")
-    return text, None, re.sub(r"[^\w.-]+", "_", text.strip("/"))[-80:]
+def _restart_with(python):
+    os.environ["CHERRY_PICKER_REEXEC"] = "1"
+    os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
-_gh_ok = None
+# The Fedora PySide6 is built for the system Python, so switch to it (e.g. from Homebrew's python3).
+if sys.prefix != "/usr" and not os.environ.get("CHERRY_PICKER_REEXEC") and os.path.exists(SYSTEM_PY):
+    _restart_with(SYSTEM_PY)
+
+sys.path.insert(0, str(HERE))
+try:  # system-wide PySide6 if there is one, else the unpacked Fedora one
+    import PySide6  # noqa: F401
+except ModuleNotFoundError:
+    import pyside_local
+    pyside_local.activate()
+
+try:
+    from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal, Slot
+    from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
+                               QKeySequence, QSyntaxHighlighter, QTextCharFormat)
+    from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter,
+                                   QDockWidget, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+                                   QMenu, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
+                                   QStackedWidget, QStyle, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
+                                   QVBoxLayout, QWidget)
+except ModuleNotFoundError:
+    if VENV_PY.exists() and Path(sys.prefix).resolve() != (HERE / ".venv").resolve():
+        _restart_with(VENV_PY)
+    sys.exit("PySide6 could not be loaded. Fetch Fedora's build for your system Qt with:\n"
+             f"  /usr/bin/python3 {HERE}/pyside_local.py")
+
+from cpcore import (COMMIT_LIMIT, GitError, Repo, branch_name, editor_args, editor_icon_path,  # noqa: E402
+                    installed_editors,
+                    launch, load_config, pr_from_subject, save_config)
+
+COL_CHECK, COL_SHA, COL_SUBJECT, COL_PR, COL_AUTHOR, COL_DATE = range(6)
 
 
-def gh_authenticated():
-    global _gh_ok
-    if _gh_ok is None:
-        try:
-            _gh_ok = subprocess.run(["gh", "auth", "status", "--hostname", "github.com"],
-                                    capture_output=True, timeout=15).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            _gh_ok = False
-    return _gh_ok
+def icon(*names):
+    """First icon from the theme that exists (Breeze names first, generic fallbacks after)."""
+    for n in names:
+        ic = QIcon.fromTheme(n)
+        if not ic.isNull():
+            return ic
+    return QIcon()
 
 
-class Repo:
-    def __init__(self, spec, log):
-        self.spec = spec.strip()
-        self.url, self.slug, name = parse_repo(spec)
-        self.path = CACHE_DIR / "repos" / name
-        self.log = log
-        self.use_gh = self.url.startswith("https://github.com/") and gh_authenticated()
+class Bridge(QObject):
+    """Runs callables on the GUI thread when emitted from worker threads."""
+    call = Signal(object)
 
-    # -- low level
-    def run(self, args, check=True, in_repo=True, quiet=False):
-        cmd = ["git"]
-        if self.use_gh:  # use the GitHub CLI login for https auth
-            cmd += ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
-        cmd += args
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "LC_ALL": "C", "LANG": "C"}
-        if not quiet:
-            self.log("$ " + shlex.join(["git"] + args))
-        p = subprocess.run(cmd, cwd=self.path if in_repo else None, capture_output=True, env=env)
-        out = p.stdout.decode("utf-8", "replace")
-        err = p.stderr.decode("utf-8", "replace")
-        if not quiet:
-            for text in (out, err):
-                if text.strip():
-                    self.log(text.rstrip())
-        if check and p.returncode:
-            msg = (err or out).strip()
-            if "could not read Username" in msg or "Authentication failed" in msg:
-                msg += ("\n\nThis repository needs authentication. Run `gh auth login` in a terminal "
-                        "(or set up SSH keys and use the git@github.com:owner/repo URL).")
-            raise GitError(f"git {args[0]} failed:\n{msg}")
-        p.out, p.err = out, err
-        return p
+    def __init__(self):
+        super().__init__()
+        self.call.connect(self._run)
 
-    def out(self, args, **kw):
-        return self.run(args, quiet=True, **kw).out
-
-    def in_pick(self):
-        return (self.path / ".git" / "CHERRY_PICK_HEAD").exists()
-
-    # -- repository
-    def sync(self):
-        if not (self.path / ".git").exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.run(["clone", "--no-tags", self.url, str(self.path)], in_repo=False)
-        else:
-            if self.in_pick():
-                self.run(["cherry-pick", "--abort"], check=False)
-            self.run(["remote", "set-url", "origin", self.url])
-            self.run(["fetch", "--prune", "--no-tags", "origin"])
-        self.run(["remote", "set-head", "origin", "--auto"], check=False, quiet=True)
-        branches = [b for b in self.out(["for-each-ref", "--sort=-committerdate",
-                                         "--format=%(refname:lstrip=3)", "refs/remotes/origin/"]).split()
-                    if b != "HEAD"]
-        head = self.run(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], check=False, quiet=True)
-        default = head.out.strip().removeprefix("origin/") if head.returncode == 0 else None
-        return branches, default
-
-    def commits(self, target, source, merges):
-        args = ["log", "--topo-order", "--cherry-mark", "--right-only", f"--max-count={COMMIT_LIMIT}",
-                "--date=short", "--format=%m%x1f%H%x1f%h%x1f%an%x1f%ad%x1f%P%x1f%s",
-                f"origin/{target}...origin/{source}", "--"]
-        if not merges:
-            args.insert(1, "--no-merges")
-        # commits already brought over with `cherry-pick -x` (patch may differ)
-        picked = set(PICKED_RE.findall(self.out(
-            ["log", "--format=%B", "--grep=cherry picked from commit",
-             f"origin/{source}..origin/{target}", "--"])))
-        result = []
-        for line in self.out(args).splitlines():
-            parts = line.split("\x1f")
-            if len(parts) != 7:
-                continue
-            mark, sha, short, author, date, parents, subject = parts
-            result.append(dict(sha=sha, short=short, author=author, date=date, subject=subject,
-                               merge=len(parents.split()) > 1,
-                               applied=mark == "=" or sha in picked))
-        return result
-
-    def show(self, sha):
-        text = self.out(["show", "--stat", "--patch", "--format=fuller", "--no-color", sha])
-        if len(text) > DIFF_LIMIT:
-            text = text[:DIFF_LIMIT] + "\n\n... (diff truncated)\n"
-        return text
-
-    # -- cherry-picking
-    def start_branch(self, target, branch):
-        if self.run(["check-ref-format", "--branch", branch], check=False, quiet=True).returncode:
-            raise GitError(f"“{branch}” is not a valid branch name.")
-        if self.in_pick():
-            self.run(["cherry-pick", "--abort"], check=False)
-        self.run(["checkout", "-f", "-B", branch, f"origin/{target}"])
-        self.run(["clean", "-fdq"])
-
-    def head(self):
-        return self.out(["rev-parse", "HEAD"]).strip()
-
-    def pick(self, sha, record_origin, merge):
-        before = self.head()
-        args = ["cherry-pick", "--allow-empty", "--empty=drop"]
-        if record_origin:
-            args.append("-x")
-        if merge:
-            args += ["-m", "1"]
-        p = self.run(args + [sha], check=False)
-        if p.returncode == 0:
-            return "ok" if self.head() != before else "dropped"
-        if self.in_pick():
-            if not self.conflicts():  # stopped but nothing conflicting -> became empty
-                self.run(["cherry-pick", "--skip"])
-                return "dropped"
-            return "conflict"
-        raise GitError(f"Cherry-pick of {sha[:10]} failed:\n{(p.err or p.out).strip()}")
-
-    def conflicts(self):
-        return [f for f in self.out(["diff", "--name-only", "--diff-filter=U", "-z"]).split("\0") if f]
-
-    def resolve_all(self, side):
-        for f in self.conflicts():
-            if self.run(["checkout", f"--{side}", "--", f], check=False).returncode:
-                self.run(["rm", "--quiet", "--", f], check=False)  # file deleted on that side
-            else:
-                self.run(["add", "--", f])
-
-    def continue_pick(self):
-        files = self.conflicts()
-        marked = []
-        for f in files:
-            p = self.path / f
-            if p.is_file():
-                data = p.read_bytes()
-                if b"<<<<<<< " in data and b">>>>>>> " in data:
-                    marked.append(f)
-        if marked:
-            raise GitError("Conflict markers are still present in:\n  " + "\n  ".join(marked) +
-                           "\n\nEdit those files (or use Take incoming / Keep target), then press Continue.")
-        if files:
-            self.run(["add", "-A", "--"] + files)
-        before = self.out(["rev-parse", "HEAD"]).strip()
-        p = self.run(["cherry-pick", "--continue"], check=False)
-        if p.returncode:
-            if self.in_pick() and not self.conflicts():  # resolution produced no changes
-                self.run(["cherry-pick", "--skip"])
-                return "dropped"
-            raise GitError(f"cherry-pick --continue failed:\n{(p.err or p.out).strip()}")
-        return "ok" if self.head() != before else "dropped"
-
-    def skip(self):
-        self.run(["cherry-pick", "--skip"])
-
-    def abort(self):
-        if self.in_pick():
-            self.run(["cherry-pick", "--abort"])
-
-    def push(self, branch):
-        self.run(["push", "-u", "origin", f"{branch}:{branch}"])
-
-    def compare_url(self, target, branch):
-        if not self.slug or target == branch:
-            return None
-        q = urllib.parse.quote
-        return f"https://github.com/{self.slug}/compare/{q(target, safe='')}...{q(branch, safe='')}?expand=1"
+    @Slot(object)
+    def _run(self, fn):
+        fn()
 
 
-# --------------------------------------------------------------------------- config
+class DiffHighlighter(QSyntaxHighlighter):
+    HEADER, BODY = 0, 1
 
-def load_config():
-    try:
-        return json.loads(CONFIG_FILE.read_text())
-    except (OSError, ValueError):
-        return {}
+    def __init__(self, doc):
+        super().__init__(doc)
+
+        def fmt(color=None, bold=False):
+            f = QTextCharFormat()
+            if color:
+                f.setForeground(QColor(color))
+            if bold:
+                f.setFontWeight(QFont.Weight.Bold)
+            return f
+        # Breeze palette: positive / negative / link
+        self.f_add, self.f_del, self.f_hunk = fmt("#27ae60"), fmt("#da4453"), fmt("#3daee9")
+        self.f_bold = fmt(bold=True)
+
+    def highlightBlock(self, text):
+        state = self.previousBlockState()
+        state = self.HEADER if state < 0 else state
+        f = None
+        if text.startswith("diff --git"):
+            state, f = self.BODY, self.f_bold
+        elif state == self.HEADER:
+            if text.startswith(("commit ", "Author:", "Commit:", "Merge:")):
+                f = self.f_bold
+        elif text.startswith(("+++", "---", "index ", "new file", "deleted file", "similarity", "rename ")):
+            f = self.f_bold
+        elif text.startswith("@@"):
+            f = self.f_hunk
+        elif text.startswith("+"):
+            f = self.f_add
+        elif text.startswith("-"):
+            f = self.f_del
+        if f:
+            self.setFormat(0, len(text), f)
+        self.setCurrentBlockState(state)
 
 
-def save_config(cfg):
-    try:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-    except OSError:
-        pass
+class MessageWidget(QFrame):
+    """Inline message in the style of KDE's KMessageWidget."""
+    COLORS = {"information": "#3daee9", "positive": "#27ae60", "warning": "#f67400", "error": "#da4453"}
+    ICONS = {"information": "dialog-information", "positive": "dialog-positive",
+             "warning": "dialog-warning", "error": "dialog-error"}
+
+    def __init__(self, kind="information", closable=False):
+        super().__init__()
+        self.setObjectName("message")
+        outer = QHBoxLayout(self)
+        self.icon_lbl = QLabel()
+        self.icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+        outer.addWidget(self.icon_lbl)
+        body = QVBoxLayout()
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        self.text.setTextFormat(Qt.TextFormat.RichText)
+        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body.addWidget(self.text)
+        self.buttons = QHBoxLayout()
+        body.addLayout(self.buttons)
+        outer.addLayout(body, 1)
+        if closable:
+            close = QToolButton()
+            close.setIcon(icon("dialog-close", "window-close"))
+            close.setAutoRaise(True)
+            close.setToolTip("Close")
+            close.clicked.connect(self.hide)
+            outer.addWidget(close, 0, Qt.AlignmentFlag.AlignTop)
+        self.set_kind(kind)
+        self.hide()
+
+    def set_kind(self, kind):
+        c = QColor(self.COLORS[kind])
+        r, g, b = c.red(), c.green(), c.blue()
+        self.setStyleSheet(f"QFrame#message {{ background-color: rgba({r},{g},{b},0.2);"
+                           f" border: 1px solid rgb({r},{g},{b}); border-radius: 5px; }}")
+        self.icon_lbl.setPixmap(icon(self.ICONS[kind]).pixmap(QSize(22, 22)))
+
+    def show_message(self, kind, text):
+        self.set_kind(kind)
+        self.text.setText(text)
+        self.show()
+
+    def add_button(self, button):
+        self.buttons.addWidget(button)
+        return button
+
+    def add_stretch(self):
+        self.buttons.addStretch(1)
 
 
-# --------------------------------------------------------------------------- UI
+class Placeholder(QWidget):
+    """Empty-state message in the style of Kirigami's PlaceholderMessage."""
 
-def hbox(spacing=6, **kw):
-    return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=spacing, **kw)
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.addStretch(1)
+        self.icon_lbl = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
+        self.icon_lbl.setEnabled(False)  # disabled = dimmed, like Kirigami
+        lay.addWidget(self.icon_lbl)
+        self.title = QLabel(alignment=Qt.AlignmentFlag.AlignCenter, wordWrap=True)
+        f = self.title.font()
+        f.setPointSizeF(f.pointSizeF() * 1.35)
+        self.title.setFont(f)
+        self.title.setEnabled(False)
+        lay.addWidget(self.title)
+        self.explanation = QLabel(alignment=Qt.AlignmentFlag.AlignCenter, wordWrap=True)
+        self.explanation.setEnabled(False)
+        lay.addWidget(self.explanation)
+        lay.addStretch(2)
+
+    def set(self, icon_names, title, explanation=""):
+        self.icon_lbl.setPixmap(icon(*icon_names).pixmap(QSize(64, 64)))
+        self.title.setText(title)
+        self.explanation.setText(explanation)
+        self.explanation.setVisible(bool(explanation))
 
 
-def vbox(spacing=6, **kw):
-    return Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing, **kw)
-
-
-def label(text, *classes, **kw):
-    kw.setdefault("xalign", 0)
-    lbl = Gtk.Label(label=text, **kw)
-    for c in classes:
-        lbl.add_css_class(c)
-    return lbl
-
-
-def button(text, cb, *classes, tooltip=None, icon=None):
-    b = Gtk.Button(icon_name=icon) if icon else Gtk.Button(label=text)
+def push_button(text, cb, tooltip=None, icons=()):
+    b = QPushButton(icon(*icons), text) if icons else QPushButton(text)
     if tooltip:
-        b.set_tooltip_text(tooltip)
-    for c in classes:
-        b.add_css_class(c)
-    b.connect("clicked", lambda *_: cb())
+        b.setToolTip(tooltip)
+    b.clicked.connect(cb)
     return b
 
 
-class CommitRow(Gtk.ListBoxRow):
-    def __init__(self, commit, on_toggle):
+def searchable_combo(min_width=240):
+    """A branch picker you can type into to filter (contains-match)."""
+    cb = QComboBox()
+    cb.setEditable(True)
+    cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    cb.setMinimumWidth(min_width)
+    cb.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+    cb.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+    return cb
+
+
+class Window(QMainWindow):
+    def __init__(self, initial_repo=None):
         super().__init__()
-        self.commit = commit
-        box = hbox(10, margin_top=5, margin_bottom=5, margin_start=6, margin_end=8)
-        self.check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-        self.check.connect("toggled", lambda *_: on_toggle())
-        box.append(self.check)
-        box.append(label(commit["short"], "sha", valign=Gtk.Align.CENTER))
-        text = vbox(2, hexpand=True)
-        subj = label(commit["subject"], ellipsize=Pango.EllipsizeMode.END)
-        subj.set_tooltip_text(commit["subject"])
-        text.append(subj)
-        meta = f"{commit['author']} · {commit['date']}" + (" · merge commit" if commit["merge"] else "")
-        text.append(label(meta, "meta", ellipsize=Pango.EllipsizeMode.END))
-        box.append(text)
-        if commit["applied"]:
-            box.append(label("already in target", "badge", valign=Gtk.Align.CENTER))
-            text.add_css_class("applied")
-        self.set_child(box)
-
-
-class Window(Gtk.ApplicationWindow):
-    def __init__(self, app, initial_repo=None):
-        super().__init__(application=app, title="Cherry Picker", default_width=1250, default_height=820)
+        self.setWindowTitle("Cherry Picker")
         self.cfg = load_config()
+        self.bridge = Bridge()
         self.repo = None
-        self.rows = []
         self.busy = 0
         self.picking = False
-        self.suppress = False
         self.branch_auto = True
-        self.diff_req = 0
+        self.diff_req = self.pr_req = 0
+        self.suggested_prs = []
+        self.conflict_files = []
         self.queue, self.qi, self.stats = [], 0, {}
         self.last_branch = self.last_target = None
+        self.result_template = ""
+        self.editors = installed_editors()
+        spacing = self.style().pixelMetric(QStyle.PixelMetric.PM_LayoutHorizontalSpacing) or 6
 
-        header = Gtk.HeaderBar()
-        self.spinner = Gtk.Spinner()
-        header.pack_end(self.spinner)
-        self.set_titlebar(header)
+        # ------------------------------------------------ toolbar
+        tb = QToolBar("Main Toolbar")
+        tb.setObjectName("mainToolBar")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(tb)
+        repo_lbl = QLabel("Repository:")
+        repo_lbl.setContentsMargins(spacing, 0, spacing, 0)
+        tb.addWidget(repo_lbl)
+        self.repo_combo = QComboBox()
+        self.repo_combo.setEditable(True)
+        self.repo_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.repo_combo.setMinimumWidth(380)
+        self.repo_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.repo_combo.lineEdit().setPlaceholderText("owner/repo, GitHub URL or git URL")
+        self.repo_combo.setToolTip("GitHub repository to cherry-pick in")
+        self.repo_combo.lineEdit().returnPressed.connect(self.on_load)
+        self.repo_combo.addItems(self.cfg.get("recent", []))
+        self.repo_combo.setCurrentIndex(-1)
+        self.repo_combo.activated.connect(lambda _i: self.on_load())
+        repo_lbl.setBuddy(self.repo_combo)
+        tb.addWidget(self.repo_combo)
+        self.load_act = tb.addAction(icon("vcs-pull", "download", "go-down"), "Load", self.on_load)
+        self.load_act.setToolTip("Clone or update the repository")
+        self.fetch_act = tb.addAction(icon("view-refresh"), "Fetch", self.on_refresh)
+        self.fetch_act.setShortcut(QKeySequence.StandardKey.Refresh)
+        self.fetch_act.setToolTip("Fetch the latest branches and commits (F5)")
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        self.menu_btn = QToolButton()
+        self.menu_btn.setIcon(icon("application-menu", "open-menu-symbolic", "preferences-other"))
+        self.menu_btn.setToolTip("Main Menu")
+        self.menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(self.menu_btn)
 
-        root = vbox(8, margin_top=10, margin_bottom=10, margin_start=12, margin_end=12)
-        self.set_child(root)
+        # ------------------------------------------------ central area
+        central = QWidget()
+        root = QVBoxLayout(central)
+        self.setCentralWidget(central)
 
-        # repository row
-        row = hbox()
-        row.append(label("Repository", "section-title"))
-        self.repo_entry = Gtk.Entry(hexpand=True, placeholder_text="owner/repo, a GitHub URL, or any git URL")
-        self.repo_entry.connect("activate", lambda *_: self.on_load())
-        row.append(self.repo_entry)
-        self.recent_btn = Gtk.MenuButton(icon_name="document-open-recent-symbolic", tooltip_text="Recent repositories")
-        row.append(self.recent_btn)
-        self.load_btn = button("Load", self.on_load, "suggested-action")
-        row.append(self.load_btn)
-        root.append(row)
-        self.rebuild_recent()
+        self.error_msg = MessageWidget("error", closable=True)
+        root.addWidget(self.error_msg)
 
-        # branch row
-        row = hbox(8)
-        row.append(label("Pick from", "section-title"))
-        self.src_dd = self.make_dropdown()
-        row.append(self.src_dd)
-        self.swap_btn = button("", self.on_swap, icon="object-flip-horizontal-symbolic", tooltip="Swap branches")
-        row.append(self.swap_btn)
-        row.append(label("onto", "section-title"))
-        self.dst_dd = self.make_dropdown()
-        row.append(self.dst_dd)
-        self.refresh_btn = button("", self.on_refresh, icon="view-refresh-symbolic", tooltip="Fetch latest from remote")
-        row.append(self.refresh_btn)
-        row.append(Gtk.Box(hexpand=True))
-        self.merges_cb = Gtk.CheckButton(label="Include merge commits")
-        self.merges_cb.connect("toggled", lambda *_: self.load_commits())
-        row.append(self.merges_cb)
-        self.hide_cb = Gtk.CheckButton(label="Hide commits already in target", active=True)
-        self.hide_cb.connect("toggled", lambda *_: (self.listbox.invalidate_filter(), self.update_count()))
-        row.append(self.hide_cb)
-        root.append(row)
+        row = QHBoxLayout()
+        src_lbl = QLabel("Pick from:")
+        row.addWidget(src_lbl)
+        self.src_combo = searchable_combo()
+        self.src_combo.setToolTip("Branch that has the commits you want")
+        src_lbl.setBuddy(self.src_combo)
+        row.addWidget(self.src_combo)
+        self.swap_btn = QToolButton()
+        self.swap_btn.setIcon(icon("exchange-positions", "object-flip-horizontal", "view-refresh"))
+        self.swap_btn.setToolTip("Swap branches")
+        self.swap_btn.clicked.connect(self.on_swap)
+        row.addWidget(self.swap_btn)
+        dst_lbl = QLabel("Onto:")
+        row.addWidget(dst_lbl)
+        self.dst_combo = searchable_combo()
+        self.dst_combo.setToolTip("Branch the commits should land on")
+        dst_lbl.setBuddy(self.dst_combo)
+        row.addWidget(self.dst_combo)
+        row.addStretch(1)
+        for cb in (self.src_combo, self.dst_combo):
+            cb.activated.connect(lambda _i: self.load_commits())
+            cb.lineEdit().returnPressed.connect(self.load_commits)
+        root.addLayout(row)
 
-        # main split: commits | diff
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True, position=600)
-        left = vbox()
-        tools = hbox()
-        self.search = Gtk.SearchEntry(hexpand=True, placeholder_text="Filter by message, author or hash")
-        self.search.connect("search-changed", lambda *_: self.listbox.invalidate_filter())
-        tools.append(self.search)
-        tools.append(button("All", lambda: self.select_visible(True), tooltip="Select all visible commits"))
-        tools.append(button("None", lambda: self.select_visible(False), tooltip="Clear selection"))
-        left.append(tools)
-        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
-        self.listbox.set_filter_func(self.row_visible)
-        self.listbox.connect("row-selected", self.on_row_selected)
-        self.placeholder = label("Load a repository to see its commits.", "meta", xalign=0.5,
-                                 margin_top=40, margin_bottom=40, wrap=True)
-        self.listbox.set_placeholder(self.placeholder)
-        left.append(Gtk.ScrolledWindow(vexpand=True, child=self.listbox, has_frame=True))
-        self.count_lbl = label("", "meta")
-        left.append(self.count_lbl)
-        paned.set_start_child(left)
-        paned.set_shrink_start_child(False)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        self.split = split
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        tools = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter…")
+        self.search.setToolTip("Filter by message, author, hash or #PR (Ctrl+F)")
+        self.search.setClearButtonEnabled(True)
+        self.search.addAction(icon("search", "edit-find"), QLineEdit.ActionPosition.LeadingPosition)
+        self.search.textChanged.connect(lambda _t: self.apply_filter())
+        tools.addWidget(self.search, 1)
+        tools.addWidget(push_button("Select All", lambda: self.select_visible(True), "Select every visible commit",
+                                    ("edit-select-all",)))
+        tools.addWidget(push_button("Deselect All", lambda: self.select_visible(False), "Clear the selection",
+                                    ("edit-select-none",)))
+        view_btn = QToolButton()
+        view_btn.setIcon(icon("view-filter", "view-more-symbolic"))
+        view_btn.setToolTip("View Options")
+        view_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        view_menu = QMenu(view_btn)
+        self.merges_act = view_menu.addAction("Show Merge Commits")
+        self.merges_act.setCheckable(True)
+        self.merges_act.toggled.connect(lambda _on: self.load_commits())
+        self.applied_act = view_menu.addAction("Show Commits Already in Target")
+        self.applied_act.setCheckable(True)
+        self.applied_act.toggled.connect(lambda _on: self.apply_filter())
+        view_btn.setMenu(view_menu)
+        tools.addWidget(view_btn)
+        lv.addLayout(tools)
 
-        self.diff = Gtk.TextView(editable=False, monospace=True, cursor_visible=False,
-                                 left_margin=8, top_margin=6, right_margin=8)
-        buf = self.diff.get_buffer()
-        buf.create_tag("add", foreground="#2ea043")
-        buf.create_tag("del", foreground="#e5484d")
-        buf.create_tag("hunk", foreground="#3b82f6")
-        buf.create_tag("file", weight=Pango.Weight.BOLD)
-        buf.create_tag("head", weight=Pango.Weight.BOLD)
-        paned.set_end_child(Gtk.ScrolledWindow(child=self.diff, has_frame=True, margin_start=6))
-        root.append(paned)
+        self.list_stack = QStackedWidget()
+        self.placeholder = Placeholder()
+        self.list_stack.addWidget(self.placeholder)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["", "Hash", "Subject", "PR", "Author", "Date"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        hdr = self.tree.header()
+        hdr.setStretchLastSection(False)
+        for col, mode in ((COL_CHECK, QHeaderView.ResizeMode.ResizeToContents),
+                          (COL_SHA, QHeaderView.ResizeMode.ResizeToContents),
+                          (COL_SUBJECT, QHeaderView.ResizeMode.Stretch),
+                          (COL_PR, QHeaderView.ResizeMode.ResizeToContents),
+                          (COL_AUTHOR, QHeaderView.ResizeMode.Interactive),
+                          (COL_DATE, QHeaderView.ResizeMode.ResizeToContents)):
+            hdr.setSectionResizeMode(col, mode)
+        self.tree.setColumnWidth(COL_AUTHOR, 140)
+        self.tree.itemChanged.connect(self.on_item_changed)
+        self.tree.currentItemChanged.connect(self.on_current_changed)
+        self.tree.itemActivated.connect(self.toggle_item)
+        self.list_stack.addWidget(self.tree)
+        lv.addWidget(self.list_stack, 1)
+        self.count_lbl = QLabel()
+        self.count_lbl.setEnabled(False)
+        lv.addWidget(self.count_lbl)
+        split.addWidget(left)
 
-        # conflict bar
-        self.conflict_bar = vbox(8, visible=False)
-        self.conflict_bar.add_css_class("bar")
-        self.conflict_bar.add_css_class("conflict-bar")
-        self.conflict_lbl = label("", wrap=True, selectable=True)
-        self.conflict_bar.append(self.conflict_lbl)
-        row = hbox()
-        row.append(button("Open folder", self.open_folder, tooltip="Open the working copy to fix conflicts in your editor"))
-        row.append(button("Take incoming", lambda: self.on_resolve("theirs"),
-                          tooltip="Resolve every conflicted file with the version from the picked commit"))
-        row.append(button("Keep target", lambda: self.on_resolve("ours"),
-                          tooltip="Resolve every conflicted file with the target branch version"))
-        row.append(Gtk.Box(hexpand=True))
-        row.append(button("Skip this commit", self.on_skip))
-        row.append(button("Stop", self.on_stop, "destructive-action",
-                          tooltip="Abort this commit and stop; earlier picks stay on the branch"))
-        row.append(button("Continue", self.on_continue, "suggested-action",
-                          tooltip="I've resolved the conflicts - commit and go on"))
-        self.conflict_bar.append(row)
-        self.conflict_btns = [c for c in iter_children(row) if isinstance(c, Gtk.Button)]
-        root.append(self.conflict_bar)
+        self.diff = QPlainTextEdit()
+        self.diff.setReadOnly(True)
+        self.diff.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.diff.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.diff.setPlaceholderText("Select a commit to see its changes")
+        self.highlighter = DiffHighlighter(self.diff.document())
+        split.addWidget(self.diff)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        root.addWidget(split, 1)
 
-        # result bar
-        self.result_bar = hbox(8, visible=False)
-        self.result_bar.add_css_class("bar")
-        self.result_bar.add_css_class("result-bar")
-        self.result_lbl = label("", wrap=True, hexpand=True, selectable=True)
-        self.result_bar.append(self.result_lbl)
-        self.push_btn = button("Push", self.on_push, "suggested-action")
-        self.pr_btn = button("Open pull request", self.on_open_pr, "suggested-action")
-        self.result_bar.append(button("Open folder", self.open_folder))
-        self.result_bar.append(self.push_btn)
-        self.result_bar.append(self.pr_btn)
-        self.result_bar.append(button("", lambda: self.result_bar.set_visible(False),
-                                      icon="window-close-symbolic", tooltip="Dismiss"))
-        root.append(self.result_bar)
+        # conflict message
+        self.conflict_msg = MessageWidget("warning")
+        m = self.conflict_msg
+        self.editor_btn = m.add_button(push_button("Open in Editor", self.open_conflicts_in_editor,
+                                                   "Open the conflicted files", ("document-edit",)))
+        m.add_button(push_button("Open Folder", self.open_folder, "Open the working copy in the file manager",
+                                 ("document-open-folder", "folder-open")))
+        m.add_button(push_button("Take Incoming", lambda: self.on_resolve("theirs"),
+                                 "Resolve every conflicted file with the version from the picked commit",
+                                 ("go-next",)))
+        m.add_button(push_button("Keep Target", lambda: self.on_resolve("ours"),
+                                 "Resolve every conflicted file with the target branch version", ("go-previous",)))
+        m.add_stretch()
+        m.add_button(push_button("Skip Commit", self.on_skip, "Leave this commit out and go on",
+                                 ("media-skip-forward",)))
+        m.add_button(push_button("Stop", self.on_stop, "Abort this commit and stop; earlier picks stay on the branch",
+                                 ("process-stop",)))
+        self.continue_btn = m.add_button(push_button("Continue", self.on_continue,
+                                                     "Commit the resolved files and go on", ("dialog-ok-apply",)))
+        self.conflict_btns = [m.buttons.itemAt(i).widget() for i in range(m.buttons.count())
+                              if isinstance(m.buttons.itemAt(i).widget(), QPushButton)]
+        root.addWidget(self.conflict_msg)
 
-        # options row
-        row = hbox(10)
-        row.append(label("New branch", "section-title"))
-        self.branch_entry = Gtk.Entry(width_chars=34, tooltip_text=(
-            "Branch to create from the target and put the picks on. "
-            "Use the target branch's own name to commit straight onto it."))
-        self.branch_entry.connect("changed", self.on_branch_edited)
-        row.append(self.branch_entry)
-        self.x_cb = Gtk.CheckButton(label="Record origin (-x)", active=self.cfg.get("record_origin", True),
-                                    tooltip_text="Append “(cherry picked from commit …)” to each message")
-        row.append(self.x_cb)
-        self.push_cb = Gtk.CheckButton(label="Push when done", active=self.cfg.get("push", False))
-        row.append(self.push_cb)
-        row.append(Gtk.Box(hexpand=True))
-        self.status = label("", "meta", ellipsize=Pango.EllipsizeMode.END, hexpand=True)
-        row.append(self.status)
-        self.go_btn = button("Cherry-pick", self.on_go, "suggested-action")
-        row.append(self.go_btn)
-        root.append(row)
+        # result message
+        self.result_msg = MessageWidget("positive", closable=True)
+        r = self.result_msg
+        r.add_button(push_button("Open Folder", self.open_folder, icons=("document-open-folder", "folder-open")))
+        self.push_btn = r.add_button(push_button("Push", self.on_push, "Push the branch to GitHub",
+                                                 ("cloud-upload", "go-up")))
+        self.pr_btn = r.add_button(push_button("Create Pull Request…", self.on_open_pr,
+                                               "Open GitHub to create the pull request",
+                                               ("vcs-merge-request", "internet-web-browser")))
+        r.add_stretch()
+        root.addWidget(self.result_msg)
 
-        # log
-        exp = Gtk.Expander(label="Git output")
-        self.logview = Gtk.TextView(editable=False, monospace=True, cursor_visible=False, left_margin=6)
-        exp.set_child(Gtk.ScrolledWindow(child=self.logview, min_content_height=160, has_frame=True))
-        root.append(exp)
+        # bottom: branch + options + primary action (bottom right)
+        row = QHBoxLayout()
+        br_lbl = QLabel("New branch:")
+        row.addWidget(br_lbl)
+        self.branch_edit = QLineEdit()
+        self.branch_edit.setMinimumWidth(300)
+        self.branch_edit.setToolTip("Branch created from the target to hold the picks. "
+                                    "Use the target branch's own name to commit straight onto it.")
+        self.branch_edit.textEdited.connect(self.on_branch_edited)
+        br_lbl.setBuddy(self.branch_edit)
+        row.addWidget(self.branch_edit)
+        row.addSpacing(spacing * 2)
+        self.x_cb = QCheckBox("Record origin (-x)")
+        self.x_cb.setToolTip("Append “(cherry picked from commit …)” to each commit message")
+        self.x_cb.setChecked(self.cfg.get("record_origin", True))
+        row.addWidget(self.x_cb)
+        self.push_cb = QCheckBox("Push when done")
+        self.push_cb.setChecked(self.cfg.get("push", False))
+        row.addWidget(self.push_cb)
+        row.addStretch(1)
+        self.go_btn = push_button("Cherry-Pick", self.on_go, "Apply the selected commits (Ctrl+Return)",
+                                  ("vcs-commit", "dialog-ok-apply"))
+        self.go_btn.setDefault(True)
+        row.addWidget(self.go_btn)
+        root.addLayout(row)
 
-        self.controls = [self.repo_entry, self.recent_btn, self.load_btn, self.src_dd, self.dst_dd,
-                         self.swap_btn, self.refresh_btn, self.merges_cb, self.branch_entry]
-        self.update_sensitivity()
+        # ------------------------------------------------ git output dock
+        self.log_dock = QDockWidget("Git Output", self)
+        self.log_dock.setObjectName("gitOutputDock")
+        self.logview = QPlainTextEdit()
+        self.logview.setReadOnly(True)
+        self.logview.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.logview.setPlaceholderText("Git commands and their output appear here")
+        self.log_dock.setWidget(self.logview)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+
+        # ------------------------------------------------ status bar
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setMaximumWidth(120)
+        self.busy_bar.hide()
+        self.statusBar().addPermanentWidget(self.busy_bar)
+
+        self.build_menu()
+        for seq, fn in (("Ctrl+Return", self.on_go), (QKeySequence.StandardKey.Find, self.search.setFocus)):
+            a = QAction(self)
+            a.setShortcut(QKeySequence(seq))
+            a.triggered.connect(fn)
+            self.addAction(a)
+
+        self.pr_timer = QTimer(self, singleShot=True, interval=250)
+        self.pr_timer.timeout.connect(self.lookup_prs)
+
+        self.controls = [self.repo_combo, self.load_act, self.fetch_act, self.src_combo, self.dst_combo,
+                         self.swap_btn, self.merges_act, self.branch_edit]
+        self.restore_layout()
+        self.set_placeholder()
+        self.update_editor_button()
         self.update_count()
 
         recent = self.cfg.get("recent", [])
         if initial_repo:
-            self.repo_entry.set_text(initial_repo)
-            GLib.idle_add(self.on_load)
+            self.repo_combo.setEditText(initial_repo)
+            QTimer.singleShot(0, self.on_load)
         elif recent:
-            self.repo_entry.set_text(recent[0])
+            self.repo_combo.setEditText(recent[0])
 
-    # ---------- helpers
-    def make_dropdown(self):
-        dd = Gtk.DropDown.new(Gtk.StringList.new([]), None)
-        dd.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
-        dd.set_enable_search(True)
-        dd.set_search_match_mode(Gtk.StringFilterMatchMode.SUBSTRING)
-        dd.set_size_request(220, -1)
-        dd.connect("notify::selected", self.on_branch_changed)
-        return dd
+    # ------------------------------------------------------------ menu & layout
+    def build_menu(self):
+        menu = QMenu(self)
+        out = self.log_dock.toggleViewAction()
+        out.setText("Show Git Output")
+        out.setIcon(icon("utilities-terminal", "view-list-text"))
+        menu.addAction(out)
+        self.folder_act = menu.addAction(icon("document-open-folder", "folder-open"), "Open Working Folder",
+                                         self.open_folder)
+        menu.addSeparator()
+        editors = menu.addMenu(icon("document-edit"), "Conflict Editor")
+        group = QActionGroup(self)
+        saved = self.cfg.get("editor")
+        self.editor_index = 0
+        for i, (name, _cmd) in enumerate(self.editors):
+            a = editors.addAction(name)
+            a.setCheckable(True)
+            group.addAction(a)
+            if name == saved or (i == 0 and saved not in [n for n, _ in self.editors]):
+                a.setChecked(True)
+                self.editor_index = i
+            a.triggered.connect(lambda _c=False, i=i: self.choose_editor(i))
+        self.auto_editor_act = menu.addAction("Open Editor Automatically on Conflict")
+        self.auto_editor_act.setCheckable(True)
+        self.auto_editor_act.setChecked(self.cfg.get("auto_editor", False))
+        self.auto_editor_act.toggled.connect(lambda _on: self.save_editor_prefs())
+        menu.addSeparator()
+        quit_act = menu.addAction(icon("application-exit"), "Quit", self.close)
+        quit_act.setShortcut(QKeySequence.StandardKey.Quit)
+        self.addAction(quit_act)
+        self.menu_btn.setMenu(menu)
 
-    @staticmethod
-    def dd_value(dd):
-        item = dd.get_selected_item()
-        return item.get_string() if item else None
+    def restore_layout(self):
+        ui = self.cfg.get("ui", {})
+        try:
+            if ui.get("geometry"):
+                self.restoreGeometry(base64.b64decode(ui["geometry"]))
+            else:
+                self.resize(1300, 850)
+            if ui.get("state"):
+                self.restoreState(base64.b64decode(ui["state"]))
+            if ui.get("split"):
+                self.split.restoreState(base64.b64decode(ui["split"]))
+            else:
+                self.split.setSizes([650, 650])
+        except (ValueError, TypeError):
+            self.resize(1300, 850)
 
-    @staticmethod
-    def dd_select(dd, value):
-        model = dd.get_model()
-        for i in range(model.get_n_items()):
-            if model.get_string(i) == value:
-                dd.set_selected(i)
-                return True
-        return False
+    def closeEvent(self, event):
+        enc = lambda b: base64.b64encode(bytes(b)).decode()  # noqa: E731
+        self.cfg["ui"] = {"geometry": enc(self.saveGeometry()), "state": enc(self.saveState()),
+                          "split": enc(self.split.saveState())}
+        save_config(self.cfg)
+        super().closeEvent(event)
 
-    def log(self, text):
-        GLib.idle_add(self._append_log, text)
+    # ------------------------------------------------------------ helpers
+    def items(self):
+        return [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
 
-    def _append_log(self, text):
-        buf = self.logview.get_buffer()
-        buf.insert(buf.get_end_iter(), text + "\n")
-        self.logview.scroll_to_mark(buf.get_insert(), 0, False, 0, 0)
-        buf.place_cursor(buf.get_end_iter())
-        return False
+    def log(self, text):  # safe from any thread
+        self.bridge.call.emit(lambda: self.logview.appendPlainText(text))
 
     def set_status(self, text):
-        self.status.set_text(text)
+        self.statusBar().showMessage(text)
 
     def error(self, exc):
         self.log(f"ERROR: {exc}")
-        dlg = Gtk.AlertDialog(message="Something went wrong", detail=str(exc))
-        dlg.show(self)
+        text = html.escape(str(exc)).replace("\n", "<br>")
+        self.error_msg.show_message("error", text)
 
     def run_bg(self, fn, done=None, fail=None):
         self.busy += 1
         self.update_sensitivity()
-
-        def work():
-            try:
-                res = fn()
-            except Exception as e:  # noqa: BLE001
-                GLib.idle_add(finish, None, e)
-            else:
-                GLib.idle_add(finish, res, None)
 
         def finish(res, exc):
             self.busy -= 1
@@ -533,250 +565,352 @@ class Window(Gtk.ApplicationWindow):
                 (fail or self.error)(exc)
             elif done:
                 done(res)
-            return False
 
+        def work():
+            try:
+                res = fn()
+            except Exception as e:  # noqa: BLE001
+                self.bridge.call.emit(lambda: finish(None, e))
+            else:
+                self.bridge.call.emit(lambda: finish(res, None))
         threading.Thread(target=work, daemon=True).start()
 
     def update_sensitivity(self):
         idle = self.busy == 0 and not self.picking
         for w in self.controls:
-            w.set_sensitive(idle)
-        self.go_btn.set_sensitive(idle and self.repo is not None and self.selected_count() > 0)
-        for b in getattr(self, "conflict_btns", []):
-            b.set_sensitive(self.busy == 0)
-        self.push_btn.set_sensitive(idle)
-        if self.busy:
-            self.spinner.start()
-        else:
-            self.spinner.stop()
+            w.setEnabled(idle)
+        self.go_btn.setEnabled(idle and self.repo is not None and self.selected_count() > 0)
+        for b in self.conflict_btns:
+            b.setEnabled(self.busy == 0)
+        self.push_btn.setEnabled(idle)
+        self.folder_act.setEnabled(self.repo is not None)
+        self.busy_bar.setVisible(self.busy > 0)
+
+    def set_placeholder(self, icons=("vcs-branch", "folder-git", "git"), title="No repository loaded",
+                        explanation="Enter a GitHub repository above and press Load."):
+        self.placeholder.set(icons, title, explanation)
+        self.list_stack.setCurrentWidget(self.placeholder)
 
     def selected_commits(self):
-        return [r.commit for r in self.rows if r.check.get_active()]
+        return [it.commit for it in self.items() if it.checkState(COL_CHECK) == Qt.CheckState.Checked]
 
     def selected_count(self):
-        return sum(r.check.get_active() for r in self.rows)
+        return len(self.selected_commits())
 
     def update_count(self):
+        items = self.items()
         n = self.selected_count()
-        shown = sum(self.row_visible(r) for r in self.rows)
-        hidden = len(self.rows) - shown
-        txt = f"{len(self.rows)} commits" if self.rows else ""
+        hidden = sum(it.isHidden() for it in items)
+        txt = f"{len(items)} commits" if items else ""
         if hidden:
-            txt += f" ({hidden} hidden)"
-        if len(self.rows) >= COMMIT_LIMIT:
-            txt += f" - showing newest {COMMIT_LIMIT}"
+            txt += f", {hidden} hidden"
+        if len(items) >= COMMIT_LIMIT:
+            txt += f" (newest {COMMIT_LIMIT} shown)"
         if n:
             txt += f" · {n} selected"
-        self.count_lbl.set_text(txt)
-        self.go_btn.set_label(f"Cherry-pick {n} commit{'s' if n != 1 else ''}" if n else "Cherry-pick")
+        self.count_lbl.setText(txt)
+        self.go_btn.setText(f"Cherry-Pick {n} Commit{'s' if n != 1 else ''}" if n else "Cherry-Pick")
         self.update_sensitivity()
 
-    def row_visible(self, row):
-        c = row.commit
-        if self.hide_cb.get_active() and c["applied"]:
+    def matches(self, c):
+        if not self.applied_act.isChecked() and c["applied"]:
             return False
-        q = self.search.get_text().strip().lower()
-        return not q or q in c["subject"].lower() or q in c["author"].lower() or c["sha"].startswith(q)
+        q = self.search.text().strip().lower()
+        if not q:
+            return True
+        pr = c.get("pr")
+        return (q in c["subject"].lower() or q in c["author"].lower() or c["sha"].startswith(q)
+                or (pr is not None and q.lstrip("#") == str(pr)))
+
+    def apply_filter(self):
+        for it in self.items():
+            it.setHidden(not self.matches(it.commit))
+        self.update_count()
 
     def select_visible(self, on):
-        for r in self.rows:
+        self.tree.blockSignals(True)
+        for it in self.items():
             if not on:
-                r.check.set_active(False)
-            elif self.row_visible(r):
-                r.check.set_active(True)
+                it.setCheckState(COL_CHECK, Qt.CheckState.Unchecked)
+            elif not it.isHidden():
+                it.setCheckState(COL_CHECK, Qt.CheckState.Checked)
+        self.tree.blockSignals(False)
+        self.tree.viewport().update()
+        self.on_selection_changed()
 
-    def rebuild_recent(self):
-        pop = Gtk.Popover()
-        box = vbox(2, margin_top=4, margin_bottom=4, margin_start=4, margin_end=4)
-        recent = self.cfg.get("recent", [])
-        for spec in recent:
-            b = Gtk.Button(label=spec, has_frame=False)
-            b.connect("clicked", lambda _b, s=spec: (pop.popdown(), self.repo_entry.set_text(s), self.on_load()))
-            box.append(b)
-        if not recent:
-            box.append(label("No recent repositories", "meta", margin_start=8, margin_end=8))
-        pop.set_child(box)
-        self.recent_btn.set_popover(pop)
+    def toggle_item(self, item, _col=0):
+        checked = item.checkState(COL_CHECK) == Qt.CheckState.Checked
+        item.setCheckState(COL_CHECK, Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked)
+
+    def on_item_changed(self, _item, col):
+        if col == COL_CHECK:
+            self.on_selection_changed()
+
+    def remember_recent(self, spec):
+        recent = [spec] + [r for r in self.cfg.get("recent", []) if r != spec]
+        self.cfg["recent"] = recent[:15]
+        save_config(self.cfg)
+        self.repo_combo.blockSignals(True)
+        self.repo_combo.clear()
+        self.repo_combo.addItems(self.cfg["recent"])
+        self.repo_combo.setEditText(spec)
+        self.repo_combo.blockSignals(False)
 
     def open_folder(self):
         if self.repo:
-            Gio.AppInfo.launch_default_for_uri(self.repo.path.as_uri(), None)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.repo.path)))
+
+    # ------------------------------------------------------------ branch name
+    def target(self):
+        return self.dst_combo.currentText().strip()
+
+    def source(self):
+        return self.src_combo.currentText().strip()
 
     def default_branch_name(self):
-        target = self.dd_value(self.dst_dd) or "target"
-        return f"cherry-pick/{target}-{datetime.datetime.now():%Y%m%d-%H%M}"
+        return branch_name(self.target() or "target", self.suggested_prs)
 
     def set_branch_suggestion(self):
         if self.branch_auto:
-            self.suppress = True
-            self.branch_entry.set_text(self.default_branch_name())
-            self.suppress = False
+            self.branch_edit.setText(self.default_branch_name())
 
-    def on_branch_edited(self, *_):
-        if not self.suppress:
-            self.branch_auto = not self.branch_entry.get_text().strip()
+    def on_branch_edited(self, text):
+        self.branch_auto = not text.strip()
 
-    # ---------- loading
+    def on_selection_changed(self):
+        self.update_count()
+        self.pr_timer.start()  # debounce: "Select All" toggles many rows at once
+
+    def lookup_prs(self):
+        """Find PR numbers of the selected commits (oldest first) for the branch name."""
+        self.pr_req += 1
+        req, repo = self.pr_req, self.repo
+        commits = list(reversed(self.selected_commits()))
+        if not repo or not commits:
+            self.suggested_prs = []
+            self.set_branch_suggestion()
+            return
+
+        def done(found):
+            for it in self.items():  # also show numbers found via the GitHub API
+                n = found.get(it.commit["sha"])
+                if n and not it.text(COL_PR):
+                    it.commit["pr"] = n
+                    it.setText(COL_PR, f"#{n}")
+            if req == self.pr_req:
+                prs = []
+                for c in commits:
+                    n = found.get(c["sha"])
+                    if n and n not in prs:
+                        prs.append(n)
+                self.suggested_prs = prs
+                self.set_branch_suggestion()
+
+        def work():
+            found = {c["sha"]: repo.pr_number(c) for c in commits}
+            self.bridge.call.emit(lambda: done(found))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ loading
     def on_load(self):
-        spec = self.repo_entry.get_text().strip()
+        spec = self.repo_combo.currentText().strip()
+        if self.busy or self.picking:
+            return
         try:
             repo = Repo(spec, self.log)
         except GitError as e:
             self.error(e)
-            return False
+            return
         self.repo = None
-        self.clear_commits("Loading…")
-        self.result_bar.set_visible(False)
+        self.clear_commits()
+        self.error_msg.hide()
+        self.result_msg.hide()
+        self.set_placeholder(("download", "folder-download"), "Loading repository…",
+                             "The first load clones the repository, which can take a while.")
         self.set_status(f"Fetching {spec}…")
-        self.run_bg(repo.sync, lambda res: self.on_loaded(repo, *res),
-                    lambda e: (self.set_status(""), self.clear_commits("Could not load the repository."), self.error(e)))
-        return False
+        self.run_bg(repo.sync, lambda res: self.on_loaded(repo, *res), self.on_load_failed)
+
+    def on_load_failed(self, e):
+        self.set_status("Could not load the repository")
+        self.set_placeholder(("dialog-error",), "Could not load the repository",
+                             "Check the name and your access, then press Load again.")
+        self.error(e)
+
+    def fill_branches(self, branches, source, target):
+        for cb, value in ((self.src_combo, source), (self.dst_combo, target)):
+            cb.blockSignals(True)
+            cb.clear()
+            cb.addItems(branches)
+            i = cb.findText(value) if value else -1
+            cb.setCurrentIndex(i if i >= 0 else 0)
+            cb.blockSignals(False)
 
     def on_loaded(self, repo, branches, default):
         self.repo = repo
+        self.setWindowTitle(repo.slug or repo.spec)  # Plasma shows "<title> — Cherry Picker"
         self.set_status(f"{len(branches)} branches")
         prefs = self.cfg.setdefault("repos", {}).get(repo.spec, {})
         target = prefs.get("target") if prefs.get("target") in branches else (default or (branches[0] if branches else None))
         others = [b for b in branches if b != target]
         source = prefs.get("source") if prefs.get("source") in others else (others[0] if others else target)
-        self.suppress = True
-        for dd in (self.src_dd, self.dst_dd):
-            m = dd.get_model()
-            m.splice(0, m.get_n_items(), branches)
-        self.dd_select(self.src_dd, source)
-        self.dd_select(self.dst_dd, target)
-        self.suppress = False
-        recent = [repo.spec] + [r for r in self.cfg.get("recent", []) if r != repo.spec]
-        self.cfg["recent"] = recent[:15]
-        save_config(self.cfg)
-        self.rebuild_recent()
+        self.fill_branches(branches, source, target)
+        self.remember_recent(repo.spec)
         self.update_sensitivity()
         self.load_commits()
 
     def on_refresh(self):
         if not self.repo:
             return self.on_load()
-        repo = self.repo
+        if self.busy or self.picking:
+            return
+        repo, src, dst = self.repo, self.source(), self.target()
         self.set_status("Fetching…")
 
         def done(res):
             branches, _ = res
-            src, dst = self.dd_value(self.src_dd), self.dd_value(self.dst_dd)
-            self.suppress = True
-            for dd in (self.src_dd, self.dst_dd):
-                m = dd.get_model()
-                m.splice(0, m.get_n_items(), branches)
-            self.dd_select(self.src_dd, src)
-            self.dd_select(self.dst_dd, dst)
-            self.suppress = False
+            self.fill_branches(branches, src, dst)
             self.set_status(f"{len(branches)} branches")
             self.load_commits()
         self.run_bg(repo.sync, done)
 
-    def on_branch_changed(self, *_):
-        if not self.suppress:
-            self.load_commits()
-
     def on_swap(self):
-        src, dst = self.dd_value(self.src_dd), self.dd_value(self.dst_dd)
-        self.suppress = True
-        self.dd_select(self.src_dd, dst)
-        self.dd_select(self.dst_dd, src)
-        self.suppress = False
+        src, dst = self.source(), self.target()
+        for cb, value in ((self.src_combo, dst), (self.dst_combo, src)):
+            cb.blockSignals(True)
+            cb.setCurrentIndex(max(cb.findText(value), 0))
+            cb.blockSignals(False)
         self.load_commits()
 
-    def clear_commits(self, msg):
-        self.listbox.remove_all()
-        self.rows = []
-        self.placeholder.set_text(msg)
-        self.diff.get_buffer().set_text("")
+    def clear_commits(self):
+        self.tree.clear()
+        self.diff.clear()
+        self.suggested_prs = []
         self.update_count()
 
     def load_commits(self):
         if not self.repo:
             return
-        src, dst = self.dd_value(self.src_dd), self.dd_value(self.dst_dd)
-        if not src or not dst:
+        src, dst = self.source(), self.target()
+        branches = [self.src_combo.itemText(i) for i in range(self.src_combo.count())]
+        if src not in branches or dst not in branches:
             return
+        self.clear_commits()
         self.set_branch_suggestion()
         if src == dst:
-            self.clear_commits("Pick two different branches.")
+            self.set_placeholder(("vcs-branch", "dialog-information"), "Pick two different branches")
             return
         self.cfg.setdefault("repos", {})[self.repo.spec] = {"source": src, "target": dst}
         save_config(self.cfg)
-        self.clear_commits("Loading commits…")
-        repo, merges = self.repo, self.merges_cb.get_active()
+        self.set_status(f"Loading commits on {src} missing from {dst}…")
+        self.set_placeholder(("view-history", "document-open-recent"), "Loading commits…")
+        repo, merges = self.repo, self.merges_act.isChecked()
 
         def done(commits):
-            if (self.dd_value(self.src_dd), self.dd_value(self.dst_dd)) != (src, dst):
+            if (self.source(), self.target()) != (src, dst):
                 return  # selection changed meanwhile
-            self.clear_commits(f"No commits on {src} that are missing from {dst}.")
+            self.tree.blockSignals(True)
+            dim = self.palette().placeholderText().color()
+            mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
             for c in commits:
-                row = CommitRow(c, self.update_count)
-                self.rows.append(row)
-                self.listbox.append(row)
-            self.update_count()
-        self.run_bg(lambda: repo.commits(dst, src, merges), done)
+                c["pr"] = pr_from_subject(c["subject"])
+                it = QTreeWidgetItem(["", c["short"], c["subject"], f"#{c['pr']}" if c["pr"] else "",
+                                      c["author"], c["date"]])
+                it.commit = c
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(COL_CHECK, Qt.CheckState.Unchecked)
+                it.setFont(COL_SHA, mono)
+                tip = c["subject"]
+                if c["merge"]:
+                    tip += "\nMerge commit: picked against its first parent"
+                if c["applied"]:
+                    tip += "\nAlready in the target branch"
+                    for col in range(6):
+                        it.setForeground(col, dim)
+                    f = it.font(COL_SUBJECT)
+                    f.setItalic(True)
+                    it.setFont(COL_SUBJECT, f)
+                it.setToolTip(COL_SUBJECT, tip)
+                self.tree.addTopLevelItem(it)
+            self.tree.blockSignals(False)
+            self.apply_filter()
+            if commits:
+                self.list_stack.setCurrentWidget(self.tree)
+                self.set_status(f"{len(commits)} commits on {src} missing from {dst}")
+            else:
+                self.set_placeholder(("checkmark", "dialog-ok"), "Nothing to cherry-pick",
+                                     f"Every commit on {src} is already in {dst}.")
+                self.set_status("")
+        self.run_bg(lambda: repo.commits(dst, src, merges), done,
+                    lambda e: (self.set_placeholder(("dialog-error",), "Could not list commits"), self.error(e)))
 
-    def on_row_selected(self, _lb, row):
-        if row is None or not self.repo:
+    def on_current_changed(self, item, _prev):
+        if item is None or not self.repo:
             return
         self.diff_req += 1
-        req, repo, sha = self.diff_req, self.repo, row.commit["sha"]
+        req, repo, sha = self.diff_req, self.repo, item.commit["sha"]
 
         def work():
             try:
                 text = repo.show(sha)
             except GitError as e:
                 text = str(e)
-            GLib.idle_add(self.show_diff, req, text)
+            self.bridge.call.emit(lambda: req == self.diff_req and self.diff.setPlainText(text))
         threading.Thread(target=work, daemon=True).start()
 
-    def show_diff(self, req, text):
-        if req != self.diff_req:
-            return False
-        buf = self.diff.get_buffer()
-        buf.set_text("")
-        it = buf.get_end_iter()
-        in_header = True
-        for line in text.splitlines(True):
-            tag = None
-            if line.startswith("diff --git"):
-                in_header, tag = False, "file"
-            elif in_header:
-                tag = "head" if re.match(r"^(commit|Author|Commit|Merge)\b", line) else None
-            elif line.startswith(("+++", "---", "index ", "new file", "deleted file", "similarity", "rename ")):
-                tag = "file"
-            elif line.startswith("@@"):
-                tag = "hunk"
-            elif line.startswith("+"):
-                tag = "add"
-            elif line.startswith("-"):
-                tag = "del"
-            if tag:
-                buf.insert_with_tags_by_name(it, line, tag)
-            else:
-                buf.insert(it, line)
-        buf.place_cursor(buf.get_start_iter())
-        self.diff.scroll_to_iter(buf.get_start_iter(), 0, False, 0, 0)
-        return False
+    # ------------------------------------------------------------ editor
+    def choose_editor(self, i):
+        self.editor_index = i
+        self.save_editor_prefs()
+        self.update_editor_button()
 
-    # ---------- cherry-picking
+    def update_editor_button(self):
+        name, cmd = self.editors[self.editor_index]
+        self.editor_btn.setText("Open in Editor" if cmd is None else f"Open in {name}")
+        if cmd:
+            path = editor_icon_path(cmd)
+            ic = QIcon(path) if path else icon(cmd, {"zed": "dev.zed.Zed", "code": "visual-studio-code",
+                                                     "kate": "org.kde.kate", "kwrite": "org.kde.kwrite"}
+                                               .get(cmd, cmd), "document-edit")
+            self.editor_btn.setIcon(ic)
+
+    def save_editor_prefs(self):
+        self.cfg["editor"] = self.editors[self.editor_index][0]
+        self.cfg["auto_editor"] = self.auto_editor_act.isChecked()
+        save_config(self.cfg)
+
+    def open_conflicts_in_editor(self):
+        if not self.repo:
+            return
+        files = [str(self.repo.path / f) for f in self.conflict_files if (self.repo.path / f).is_file()]
+        name, cmd = self.editors[self.editor_index]
+        try:
+            if cmd is None:
+                for f in files:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(f))
+            else:
+                args = editor_args(cmd, self.repo.path, files)
+                self.log("$ " + shlex.join(args))
+                launch(args, self.repo.path)
+        except OSError as e:
+            self.error(GitError(f"Could not start {name}: {e}"))
+
+    # ------------------------------------------------------------ cherry-picking
     def on_go(self):
         commits = self.selected_commits()
-        if not commits or not self.repo:
+        if not commits or not self.repo or self.busy or self.picking:
             return
         commits.reverse()  # list is newest first; apply oldest first
-        target = self.dd_value(self.dst_dd)
-        branch = self.branch_entry.get_text().strip() or self.default_branch_name()
-        self.cfg["record_origin"] = self.x_cb.get_active()
-        self.cfg["push"] = self.push_cb.get_active()
+        target = self.target()
+        branch = self.branch_edit.text().strip() or self.default_branch_name()
+        self.cfg["record_origin"] = self.x_cb.isChecked()
+        self.cfg["push"] = self.push_cb.isChecked()
         save_config(self.cfg)
         self.queue, self.qi = commits, 0
         self.stats = {"ok": [], "dropped": [], "skipped": []}
         self.last_branch, self.last_target = branch, target
         self.picking = True
-        self.result_bar.set_visible(False)
+        self.result_msg.hide()
+        self.error_msg.hide()
         self.log(f"--- cherry-picking {len(commits)} commit(s) onto new branch {branch} (from origin/{target})")
         self.set_status(f"Creating {branch}…")
         self.run_bg(lambda: self.repo.start_branch(target, branch), lambda _: self.pick_next(),
@@ -786,8 +920,8 @@ class Window(Gtk.ApplicationWindow):
         if self.qi >= len(self.queue):
             return self.finish()
         c = self.queue[self.qi]
-        self.set_status(f"Picking {self.qi + 1}/{len(self.queue)}: {c['short']} {c['subject']}")
-        record = self.x_cb.get_active()
+        self.set_status(f"Picking {self.qi + 1} of {len(self.queue)}: {c['short']} {c['subject']}")
+        record = self.x_cb.isChecked()
         self.run_bg(lambda: self.repo.pick(c["sha"], record, c["merge"]), self.after_pick,
                     lambda e: (self.finish(stopped=True), self.error(e)))
 
@@ -803,16 +937,21 @@ class Window(Gtk.ApplicationWindow):
         self.pick_next()
 
     def show_conflict(self, files):
+        self.conflict_files = files
         c = self.queue[self.qi]
         self.set_status(f"Conflict in {c['short']}")
-        listing = "\n".join(f"  • {f}" for f in files)
-        self.conflict_lbl.set_markup(
-            f"<b>Conflict while picking {c['short']} “{GLib.markup_escape_text(c['subject'])}”</b> "
-            f"({self.qi + 1} of {len(self.queue)})\n"
-            f"Files with conflicts:\n{GLib.markup_escape_text(listing)}\n"
-            f"Fix them in <tt>{GLib.markup_escape_text(str(self.repo.path))}</tt> and press Continue, "
-            "or resolve all files one way with the buttons below.")
-        self.conflict_bar.set_visible(True)
+        esc = html.escape
+        listing = "<br>".join(f"&nbsp;&nbsp;•&nbsp;<tt>{esc(f)}</tt>" for f in files)
+        self.conflict_msg.show_message(
+            "warning",
+            f"<b>Conflict while picking {c['short']} “{esc(c['subject'])}”</b> "
+            f"({self.qi + 1} of {len(self.queue)})<br>{listing}<br>"
+            "Resolve the conflicts and press <b>Continue</b>, or settle every file one way with "
+            "<i>Take Incoming</i> or <i>Keep Target</i>.")
+        self.continue_btn.setDefault(True)
+        self.continue_btn.setFocus()
+        if self.auto_editor_act.isChecked():
+            self.open_conflicts_in_editor()
 
     def on_resolve(self, side):
         self.run_bg(lambda: (self.repo.resolve_all(side), self.repo.continue_pick())[1], self.after_resolve)
@@ -821,12 +960,12 @@ class Window(Gtk.ApplicationWindow):
         self.run_bg(self.repo.continue_pick, self.after_resolve)
 
     def after_resolve(self, result):
-        self.conflict_bar.set_visible(False)
+        self.conflict_msg.hide()
         self.after_pick(result)
 
     def on_skip(self):
         def done(_):
-            self.conflict_bar.set_visible(False)
+            self.conflict_msg.hide()
             self.stats["skipped"].append(self.queue[self.qi])
             self.qi += 1
             self.pick_next()
@@ -837,30 +976,29 @@ class Window(Gtk.ApplicationWindow):
 
     def end_picking(self):
         self.picking = False
-        self.conflict_bar.set_visible(False)
+        self.conflict_msg.hide()
         self.update_sensitivity()
 
     def finish(self, stopped=False):
         self.end_picking()
         ok, dropped, skipped = self.stats["ok"], self.stats["dropped"], self.stats["skipped"]
         parts = [f"<b>{len(ok)} commit{'s' if len(ok) != 1 else ''} picked</b> onto "
-                 f"<tt>{GLib.markup_escape_text(self.last_branch)}</tt> (local)"]
+                 f"<tt>{html.escape(self.last_branch)}</tt> (%STATE%)"]
         if dropped:
             parts.append(f"{len(dropped)} already present")
         if skipped:
             parts.append(f"{len(skipped)} skipped")
         if stopped:
-            remaining = len(self.queue) - self.qi
-            parts.append(f"stopped with {remaining} not picked")
-        self.result_lbl.set_markup(", ".join(parts) + ".")
+            parts.append(f"stopped with {len(self.queue) - self.qi} not picked")
+        self.result_template = ", ".join(parts) + "."
+        kind = "positive" if ok and not stopped else "information"
+        self.result_msg.show_message(kind, self.result_template.replace("%STATE%", "local"))
         self.set_status("Stopped" if stopped else "Done")
-        self.push_btn.set_visible(bool(ok))
-        self.pr_btn.set_visible(False)
-        self.result_bar.set_visible(True)
+        self.push_btn.setVisible(bool(ok))
+        self.pr_btn.hide()
         self.branch_auto = True
-        if ok and self.push_cb.get_active():
+        if ok and self.push_cb.isChecked():
             self.on_push()
-        return False
 
     def on_push(self):
         branch = self.last_branch
@@ -870,36 +1008,27 @@ class Window(Gtk.ApplicationWindow):
 
         def done(_):
             self.set_status(f"Pushed {branch}")
-            self.result_lbl.set_markup(self.result_lbl.get_label().replace("(local)", "(pushed)"))
-            self.push_btn.set_visible(False)
-            self.pr_btn.set_visible(self.repo.compare_url(self.last_target, branch) is not None)
+            self.result_msg.text.setText(self.result_template.replace("%STATE%", "pushed"))
+            self.push_btn.hide()
+            self.pr_btn.setVisible(self.repo.compare_url(self.last_target, branch) is not None)
         self.run_bg(lambda: self.repo.push(branch), done)
 
     def on_open_pr(self):
         url = self.repo and self.repo.compare_url(self.last_target, self.last_branch)
         if url:
-            Gio.AppInfo.launch_default_for_uri(url, None)
+            QDesktopServices.openUrl(QUrl(url))
 
 
-def iter_children(widget):
-    child = widget.get_first_child()
-    while child:
-        yield child
-        child = child.get_next_sibling()
-
-
-class App(Gtk.Application):
-    def __init__(self, initial_repo):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
-        self.initial_repo = initial_repo
-
-    def do_activate(self):
-        css = Gtk.CssProvider()
-        css.load_from_string(CSS)
-        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
-                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        Window(self, self.initial_repo).present()
+def main():
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName("cherry-picker")
+    app.setApplicationDisplayName("Cherry Picker")
+    app.setDesktopFileName("cherry-picker")  # lets Plasma match the window to the launcher and its icon
+    app.setWindowIcon(icon("vcs-merge-request", "git", "applications-development"))
+    win = Window(sys.argv[1] if len(sys.argv) > 1 else None)
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    App(sys.argv[1] if len(sys.argv) > 1 else None).run([sys.argv[0]])
+    main()
