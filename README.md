@@ -53,5 +53,6 @@ python3 build.py                    # builds dist/cherry-picker.pyz
 | `cherry_picker/__main__.py` | command line and start-up |
 | `build.py` | builds the single-file `.pyz` |
 
-**Releasing:** push a tag like `v0.2.0`. The GitHub Actions workflow builds `cherry-picker.pyz`
-and publishes it as a release, which is what the install command downloads.
+**Releasing:** every push to `main` (for example a merged pull request) makes the GitHub Actions
+workflow build `cherry-picker.pyz` and publish it as release `v0.1.<build number>`, which is what
+the install command downloads. To choose the version yourself, push a tag such as `v0.2.0`.

@@ -1,12 +1,19 @@
 name: Release
 
-# Push a tag like v0.2.0 to build cherry-picker.pyz and publish it as a GitHub release.
+# Builds cherry-picker.pyz and publishes it as a GitHub release:
+#  - every push to main (e.g. a merged pull request) releases v0.1.<build number>
+#  - pushing a tag like v0.2.0 releases exactly that version
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -14,8 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Pick the version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v0.1.${{ github.run_number }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Build cherry-picker.pyz
-        run: python3 build.py "${GITHUB_REF_NAME}"
+        run: python3 build.py "${{ steps.version.outputs.tag }}"
 
       - name: Check that it runs
         run: python3 dist/cherry-picker.pyz --version
@@ -23,4 +40,11 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/cherry-picker.pyz --title "$GITHUB_REF_NAME" --generate-notes
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists - uploading the build to it"
+            gh release upload "$TAG" dist/cherry-picker.pyz --clobber
+          else
+            gh release create "$TAG" dist/cherry-picker.pyz --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          fi
