@@ -184,7 +184,7 @@ def searchable_combo(min_width=240):
 class Window(QMainWindow):
     def __init__(self, initial_repo=None):
         super().__init__()
-        self.setWindowTitle("Cherry Picker")
+        self.setWindowTitle(QApplication.applicationDisplayName())  # "Cherry Picker <version>"
         self.cfg = load_config()
         self.bridge = Bridge()
         self.repo = None
@@ -707,7 +707,7 @@ class Window(QMainWindow):
 
     def on_loaded(self, repo, branches, default):
         self.repo = repo
-        self.setWindowTitle(repo.slug or repo.spec)  # Plasma shows "<title> — Cherry Picker"
+        self.setWindowTitle(f"{repo.slug or repo.spec} — {QApplication.applicationDisplayName()}")  # Qt won't append the name twice
         self.set_status(f"{len(branches)} branches")
         prefs = self.cfg.setdefault("repos", {}).get(repo.spec, {})
         target = prefs.get("target") if prefs.get("target") in branches else (default or (branches[0] if branches else None))
@@ -982,7 +982,7 @@ class Window(QMainWindow):
 def run(initial_repo=None):
     app = QApplication([sys.argv[0]])
     app.setApplicationName("cherry-picker")
-    app.setApplicationDisplayName("Cherry Picker")
+    app.setApplicationDisplayName(f"Cherry Picker {__version__}")  # keeps the version in the title bar
     app.setApplicationVersion(__version__)
     app.setDesktopFileName("cherry-picker")  # lets Plasma match the window to the launcher and its icon
     app.setWindowIcon(icon("vcs-merge-request", "git", "applications-development"))
