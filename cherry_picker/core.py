@@ -349,6 +349,19 @@ class Repo:
                   f"+refs/heads/{info['base']}:refs/pr-base/{n}"], use_gh=use_gh)
         return self.out(["rev-parse", f"refs/pr/{n}"]).strip()
 
+    def _can_push_to(self, info):
+        """Whether the rebased branch can go back: your own branch or fork, or a fork that allows edits
+        from maintainers. True as well when GitHub won't say (not logged in to gh): git push then decides."""
+        if info["head_repo"] is None:
+            return False
+        if info["same_repo"]:
+            return True
+        try:
+            push = (github_api(f"repos/{info['head_repo']}").get("permissions") or {}).get("push")
+        except GitError:
+            push = None
+        return push is not False or info["can_modify"]
+
     def pr_info(self, number, slug=None):
         """The pull request from the GitHub API, plus its commits fetched into refs/pr/<number>."""
         if not self.slug:
@@ -365,6 +378,7 @@ class Repo:
                     base_repo=base_repo)
         # the head branch lives in the loaded repository (e.g. your fork): push through origin
         info["same_repo"] = (info["head_repo"] or "").lower() == self.slug.lower()
+        info["can_push"] = self._can_push_to(info)
         info["fetched_sha"] = self._fetch_pr_refs(info)
         info["commits"] = self.log_commits("--topo-order", f"refs/pr-base/{number}..refs/pr/{number}")
         info["behind"] = int(self.out(["rev-list", "--count", f"refs/pr/{number}..refs/pr-base/{number}"]).strip())

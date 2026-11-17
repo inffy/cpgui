@@ -1459,7 +1459,7 @@ class Window(QMainWindow):
 
     def b_can_push(self):
         pr = self.b_pr
-        return bool(pr) and (pr["same_repo"] or (pr["can_modify"] and pr["head_repo"] is not None))
+        return bool(pr) and pr["can_push"]
 
     def on_rebase_lookup(self):
         if not self.repo or self.busy or self.picking:

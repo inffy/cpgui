@@ -17,7 +17,9 @@ pull request steps.
 The **Rebase PR** tab handles "can you rebase this PR?": enter the PR number, and it fetches the PR,
 rebases it onto the latest base branch, helps you through conflicts, then force-pushes it back to
 the PR's branch. The push uses `--force-with-lease`, so it is refused if the author pushed in the
-meantime. Pushing to a PR from a fork needs "Allow edits from maintainers" ticked on the PR.
+meantime. It works from either the upstream repository or your fork: a PR opened from your fork
+is found upstream and pushed back to your fork. A PR from someone else's fork can only be pushed
+when its author ticked "Allow edits from maintainers".
 
 The repository is cloned into `~/.cache/cherry-picker/`, so your own checkouts are never touched.
 
