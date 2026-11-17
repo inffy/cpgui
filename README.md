@@ -5,6 +5,11 @@ Pick a source and a target branch, tick the commits, and it creates a branch suc
 `123-to-stable` (named after the PRs the commits came from), applies them and helps you
 through conflicts. It can then push the branch and open the pull request page.
 
+The **Promote** tab merges a whole branch into another instead, e.g. `main` into `stable-f45`.
+It lists the commits the merge would bring in, then fetches, creates `promote-main-to-stable-f45`
+from the target, merges, helps you through conflicts, and pushes the branch to the repository or
+to your fork (*Push to fork*, e.g. `you/repo`) before opening the pull request page.
+
 The repository is cloned into `~/.cache/cherry-picker/`, so your own checkouts are never touched.
 
 ## Install

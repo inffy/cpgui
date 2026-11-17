@@ -75,9 +75,9 @@ class Repo:
         self.pr_cache = {}
 
     # -- low level
-    def run(self, args, check=True, in_repo=True, quiet=False):
+    def run(self, args, check=True, in_repo=True, quiet=False, use_gh=None):
         cmd = ["git"]
-        if self.use_gh:  # use the GitHub CLI login for https auth
+        if self.use_gh if use_gh is None else use_gh:  # use the GitHub CLI login for https auth
             cmd += ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
         cmd += args
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "LC_ALL": "C", "LANG": "C"}
@@ -105,14 +105,23 @@ class Repo:
     def in_pick(self):
         return (self.path / ".git" / "CHERRY_PICK_HEAD").exists()
 
+    def in_merge(self):
+        return (self.path / ".git" / "MERGE_HEAD").exists()
+
+    def abort_unfinished(self):
+        """Drop a cherry-pick or merge left half-done (e.g. the app was closed during a conflict)."""
+        if self.in_pick():
+            self.run(["cherry-pick", "--abort"], check=False)
+        if self.in_merge():
+            self.run(["merge", "--abort"], check=False)
+
     # -- repository
     def sync(self):
         if not (self.path / ".git").exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.run(["clone", "--no-tags", self.url, str(self.path)], in_repo=False)
         else:
-            if self.in_pick():
-                self.run(["cherry-pick", "--abort"], check=False)
+            self.abort_unfinished()
             self.run(["remote", "set-url", "origin", self.url])
             self.run(["fetch", "--prune", "--no-tags", "origin"])
         self.run(["remote", "set-head", "origin", "--auto"], check=False, quiet=True)
@@ -151,15 +160,15 @@ class Repo:
         return text
 
     # -- cherry-picking
-    def start_branch(self, target, branch):
+    def new_branch(self, target, branch):
+        """Fresh local branch `branch` at origin/<target> (recreated if it exists)."""
         if self.run(["check-ref-format", "--branch", branch], check=False, quiet=True).returncode:
             raise GitError(f"“{branch}” is not a valid branch name.")
         if self.run(["var", "GIT_COMMITTER_IDENT"], check=False, quiet=True).returncode:
             raise GitError("Git doesn't know who you are, so it can't make commits. Set your name and email:\n"
                            '  git config --global user.name "Your Name"\n'
                            "  git config --global user.email you@example.com")
-        if self.in_pick():
-            self.run(["cherry-pick", "--abort"], check=False)
+        self.abort_unfinished()
         self.run(["checkout", "-f", "-B", branch, f"origin/{target}"])
         self.run(["clean", "-fdq"])
 
@@ -198,7 +207,8 @@ class Repo:
             else:
                 self.run(["add", "--", f])
 
-    def continue_pick(self):
+    def stage_resolved(self, button="Continue"):
+        """`git add` the conflicted files, refusing while any still has conflict markers."""
         files = self.conflicts()
         marked = []
         for f in files:
@@ -209,9 +219,12 @@ class Repo:
                     marked.append(f)
         if marked:
             raise GitError("Conflict markers are still present in:\n  " + "\n  ".join(marked) +
-                           "\n\nEdit those files (or use Take incoming / Keep target), then press Continue.")
+                           f"\n\nEdit those files (or use Take Incoming / Keep Target), then press {button}.")
         if files:
             self.run(["add", "-A", "--"] + files)
+
+    def continue_pick(self):
+        self.stage_resolved()
         before = self.out(["rev-parse", "HEAD"]).strip()
         p = self.run(["cherry-pick", "--continue"], check=False)
         if p.returncode:
@@ -228,8 +241,59 @@ class Repo:
         if self.in_pick():
             self.run(["cherry-pick", "--abort"])
 
-    def push(self, branch):
-        self.run(["push", "-u", "origin", f"{branch}:{branch}"])
+    def push(self, branch, fork=None):
+        """Push to this repository, or to `fork` (owner/repo or a git URL) through a `fork` remote."""
+        if not fork:
+            self.run(["push", "-u", "origin", f"{branch}:{branch}"])
+            return
+        url, _slug, _name = parse_repo(fork)
+        if self.run(["remote", "get-url", "fork"], check=False, quiet=True).returncode:
+            self.run(["remote", "add", "fork", url])
+        else:
+            self.run(["remote", "set-url", "fork", url])
+        self.run(["push", "-u", "fork", f"{branch}:{branch}"],
+                 use_gh=url.startswith("https://github.com/") and gh_authenticated())
+
+    # -- promoting (merge a whole branch into another)
+    def promote_commits(self, target, source):
+        """Commits a merge of origin/<source> would bring into origin/<target>, newest first."""
+        out = self.out(["log", "--topo-order", f"--max-count={COMMIT_LIMIT}", "--date=short",
+                        "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%P%x1f%s",
+                        f"origin/{target}..origin/{source}", "--"])
+        result = []
+        for line in out.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) != 6:
+                continue
+            sha, short, author, date, parents, subject = parts
+            result.append(dict(sha=sha, short=short, author=author, date=date, subject=subject,
+                               merge=len(parents.split()) > 1, applied=False))
+        total = int(self.out(["rev-list", "--count", f"origin/{target}..origin/{source}", "--"]).strip() or 0)
+        stat = self.out(["diff", "--shortstat", f"origin/{target}...origin/{source}", "--"]).strip()
+        return result, total, stat
+
+    def fetch(self):
+        self.run(["fetch", "--prune", "--no-tags", "origin"])
+
+    def merge(self, source):
+        """Merge origin/<source> into the current branch: "ok", "uptodate" or "conflict"."""
+        before = self.head()
+        p = self.run(["merge", "--no-edit", f"origin/{source}"], check=False)
+        if p.returncode == 0:
+            return "ok" if self.head() != before else "uptodate"
+        if self.in_merge() and self.conflicts():
+            return "conflict"
+        if self.in_merge():
+            self.run(["merge", "--abort"], check=False)
+        raise GitError(f"Merging origin/{source} failed:\n{(p.err or p.out).strip()}")
+
+    def commit_merge(self):
+        self.stage_resolved("Commit Merge")
+        self.run(["commit", "--no-edit"])
+
+    def abort_merge(self):
+        if self.in_merge():
+            self.run(["merge", "--abort"])
 
     def pr_number(self, commit):
         """PR number that introduced this commit: from the subject, else asked from GitHub."""
@@ -260,11 +324,20 @@ class Repo:
         self.pr_cache[sha] = n
         return n
 
-    def compare_url(self, target, branch):
-        if not self.slug or target == branch:
-            return None
+    def compare_url(self, target, branch, fork=None):
+        """GitHub page to open a PR of `branch` (on this repo, or on the fork) into `target`."""
         q = urllib.parse.quote
-        return f"https://github.com/{self.slug}/compare/{q(target, safe='')}...{q(branch, safe='')}?expand=1"
+        head = q(branch, safe="")
+        if fork:
+            fork_slug = parse_repo(fork)[1]
+            if not fork_slug:
+                return None
+            head = f"{q(fork_slug.split('/')[0], safe='')}:{head}"
+        elif target == branch:
+            return None
+        if not self.slug:
+            return None
+        return f"https://github.com/{self.slug}/compare/{q(target, safe='')}...{head}?expand=1"
 
 
 # --------------------------------------------------------------------------- config
@@ -289,6 +362,19 @@ def branch_name(target, prs, now=None):
     if prs:
         return "-".join(map(str, prs)) + f"-to-{target}"
     return f"cherry-pick-{(now or datetime.datetime.now()):%Y%m%d-%H%M}-to-{target}"
+
+
+def promote_branch_name(source, target):
+    return f"promote-{source}-to-{target}"
+
+
+def guess_promote_target(branches, default):
+    """Newest branch that looks like a stable/release branch, else the newest other branch."""
+    others = [b for b in branches if b != default]
+    for b in others:  # `branches` is newest first
+        if re.search(r"stable|release", b, re.I):
+            return b
+    return others[0] if others else default
 
 
 def _search_path():

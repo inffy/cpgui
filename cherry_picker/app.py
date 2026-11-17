@@ -11,14 +11,15 @@ from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFon
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter,
                                QDockWidget, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
                                QMenu, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
-                               QStackedWidget, QStyle, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
+                               QStackedWidget, QStyle, QTabWidget, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
 from . import __version__
-from .core import (COMMIT_LIMIT, GitError, Repo, branch_name, editor_args, editor_icon_path, installed_editors,
-                   launch, load_config, pr_from_subject, save_config)
+from .core import (COMMIT_LIMIT, GitError, Repo, branch_name, editor_args, editor_icon_path, guess_promote_target,
+                   installed_editors, launch, load_config, pr_from_subject, promote_branch_name, save_config)
 
 COL_CHECK, COL_SHA, COL_SUBJECT, COL_PR, COL_AUTHOR, COL_DATE = range(6)
+P_SHA, P_SUBJECT, P_PR, P_AUTHOR, P_DATE = range(5)  # columns of the Promote tab's list
 
 
 def icon(*names):
@@ -197,6 +198,11 @@ class Window(QMainWindow):
         self.queue, self.qi, self.stats = [], 0, {}
         self.last_branch = self.last_target = None
         self.result_template = ""
+        self.p_branch_auto = True
+        self.p_total = 0  # commits the promote merge would bring in
+        self.p_diff_req = 0
+        self.p_last = {}  # source / target / branch / fork of the last promotion
+        self.p_result_template = ""
         self.editors = installed_editors()
         spacing = self.style().pixelMetric(QStyle.PixelMetric.PM_LayoutHorizontalSpacing) or 6
 
@@ -243,6 +249,14 @@ class Window(QMainWindow):
 
         self.error_msg = MessageWidget("error", closable=True)
         root.addWidget(self.error_msg)
+
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        root.addWidget(self.tabs, 1)
+        pick_tab = QWidget()
+        i = self.tabs.addTab(pick_tab, icon("vcs-commit", "edit-copy"), "Cherry-Pick")
+        self.tabs.setTabToolTip(i, "Copy chosen commits from one branch onto another")
+        root = QVBoxLayout(pick_tab)
 
         row = QHBoxLayout()
         src_lbl = QLabel("Pick from:")
@@ -402,6 +416,8 @@ class Window(QMainWindow):
         row.addWidget(self.go_btn)
         root.addLayout(row)
 
+        self.build_promote_tab(spacing)
+
         # ------------------------------------------------ git output dock
         self.log_dock = QDockWidget("Git Output", self)
         self.log_dock.setObjectName("gitOutputDock")
@@ -421,7 +437,7 @@ class Window(QMainWindow):
         self.statusBar().addPermanentWidget(self.busy_bar)
 
         self.build_menu()
-        for seq, fn in (("Ctrl+Return", self.on_go), (QKeySequence.StandardKey.Find, self.search.setFocus)):
+        for seq, fn in (("Ctrl+Return", self.on_primary), (QKeySequence.StandardKey.Find, self.search.setFocus)):
             a = QAction(self)
             a.setShortcut(QKeySequence(seq))
             a.triggered.connect(fn)
@@ -431,7 +447,8 @@ class Window(QMainWindow):
         self.pr_timer.timeout.connect(self.lookup_prs)
 
         self.controls = [self.repo_combo, self.load_act, self.fetch_act, self.src_combo, self.dst_combo,
-                         self.swap_btn, self.merges_act, self.branch_edit]
+                         self.swap_btn, self.merges_act, self.branch_edit,
+                         self.p_src_combo, self.p_dst_combo, self.p_branch_edit, self.p_fork_edit]
         self.restore_layout()
         self.set_placeholder()
         self.update_editor_button()
@@ -489,13 +506,19 @@ class Window(QMainWindow):
                 self.split.restoreState(base64.b64decode(ui["split"]))
             else:
                 self.split.setSizes([650, 650])
+            if ui.get("promote_split"):
+                self.p_split.restoreState(base64.b64decode(ui["promote_split"]))
+            else:
+                self.p_split.setSizes([650, 650])
+            self.tabs.setCurrentIndex(int(ui.get("tab", 0)))
         except (ValueError, TypeError):
             self.resize(1300, 850)
 
     def closeEvent(self, event):
         enc = lambda b: base64.b64encode(bytes(b)).decode()  # noqa: E731
         self.cfg["ui"] = {"geometry": enc(self.saveGeometry()), "state": enc(self.saveState()),
-                          "split": enc(self.split.saveState())}
+                          "split": enc(self.split.saveState()), "promote_split": enc(self.p_split.saveState()),
+                          "tab": self.tabs.currentIndex()}
         save_config(self.cfg)
         super().closeEvent(event)
 
@@ -543,6 +566,11 @@ class Window(QMainWindow):
         for b in self.conflict_btns:
             b.setEnabled(self.busy == 0)
         self.push_btn.setEnabled(idle)
+        self.p_go_btn.setEnabled(idle and self.repo is not None and self.p_total > 0
+                                 and self.p_source() != self.p_target())
+        for b in self.p_conflict_btns:
+            b.setEnabled(self.busy == 0)
+        self.p_push_btn.setEnabled(idle)
         self.folder_act.setEnabled(self.repo is not None)
         self.busy_bar.setVisible(self.busy > 0)
 
@@ -683,6 +711,9 @@ class Window(QMainWindow):
             return
         self.repo = None
         self.clear_commits()
+        self.clear_promote()
+        self.p_result_msg.hide()
+        self.set_p_placeholder(("download", "folder-download"), "Loading repository…")
         self.error_msg.hide()
         self.result_msg.hide()
         self.set_placeholder(("download", "folder-download"), "Loading repository…",
@@ -694,10 +725,12 @@ class Window(QMainWindow):
         self.set_status("Could not load the repository")
         self.set_placeholder(("dialog-error",), "Could not load the repository",
                              "Check the name and your access, then press Load again.")
+        self.set_p_placeholder(("dialog-error",), "Could not load the repository")
         self.error(e)
 
-    def fill_branches(self, branches, source, target):
-        for cb, value in ((self.src_combo, source), (self.dst_combo, target)):
+    def fill_branches(self, branches, source, target, combos=None):
+        src_cb, dst_cb = combos or (self.src_combo, self.dst_combo)
+        for cb, value in ((src_cb, source), (dst_cb, target)):
             cb.blockSignals(True)
             cb.clear()
             cb.addItems(branches)
@@ -714,9 +747,17 @@ class Window(QMainWindow):
         others = [b for b in branches if b != target]
         source = prefs.get("source") if prefs.get("source") in others else (others[0] if others else target)
         self.fill_branches(branches, source, target)
+        pp = prefs.get("promote", {})
+        p_src = pp.get("source") if pp.get("source") in branches else (default or (branches[0] if branches else None))
+        p_dst = pp.get("target") if pp.get("target") in branches and pp.get("target") != p_src \
+            else guess_promote_target(branches, p_src)
+        self.fill_branches(branches, p_src, p_dst, (self.p_src_combo, self.p_dst_combo))
+        self.p_fork_edit.setText(pp.get("fork", ""))
+        self.p_branch_auto = True
         self.remember_recent(repo.spec)
         self.update_sensitivity()
         self.load_commits()
+        self.load_promote()
 
     def on_refresh(self):
         if not self.repo:
@@ -724,13 +765,16 @@ class Window(QMainWindow):
         if self.busy or self.picking:
             return
         repo, src, dst = self.repo, self.source(), self.target()
+        p_src, p_dst = self.p_source(), self.p_target()
         self.set_status("Fetching…")
 
         def done(res):
             branches, _ = res
             self.fill_branches(branches, src, dst)
+            self.fill_branches(branches, p_src, p_dst, (self.p_src_combo, self.p_dst_combo))
             self.set_status(f"{len(branches)} branches")
             self.load_commits()
+            self.load_promote()
         self.run_bg(repo.sync, done)
 
     def on_swap(self):
@@ -759,7 +803,7 @@ class Window(QMainWindow):
         if src == dst:
             self.set_placeholder(("vcs-branch", "dialog-information"), "Pick two different branches")
             return
-        self.cfg.setdefault("repos", {})[self.repo.spec] = {"source": src, "target": dst}
+        self.cfg.setdefault("repos", {}).setdefault(self.repo.spec, {}).update(source=src, target=dst)
         save_config(self.cfg)
         self.set_status(f"Loading commits on {src} missing from {dst}…")
         self.set_placeholder(("view-history", "document-open-recent"), "Loading commits…")
@@ -825,13 +869,16 @@ class Window(QMainWindow):
 
     def update_editor_button(self):
         name, cmd = self.editors[self.editor_index]
-        self.editor_btn.setText("Open in Editor" if cmd is None else f"Open in {name}")
+        ic = None
         if cmd:
             path = editor_icon_path(cmd)
             ic = QIcon(path) if path else icon(cmd, {"zed": "dev.zed.Zed", "code": "visual-studio-code",
                                                      "kate": "org.kde.kate", "kwrite": "org.kde.kwrite"}
                                                .get(cmd, cmd), "document-edit")
-            self.editor_btn.setIcon(ic)
+        for b in (self.editor_btn, self.p_editor_btn):
+            b.setText("Open in Editor" if cmd is None else f"Open in {name}")
+            if ic:
+                b.setIcon(ic)
 
     def save_editor_prefs(self):
         self.cfg["editor"] = self.editors[self.editor_index][0]
@@ -855,6 +902,9 @@ class Window(QMainWindow):
             self.error(GitError(f"Could not start {name}: {e}"))
 
     # ------------------------------------------------------------ cherry-picking
+    def on_primary(self):  # Ctrl+Return
+        (self.on_promote if self.tabs.currentWidget() is self.promote_tab else self.on_go)()
+
     def on_go(self):
         commits = self.selected_commits()
         if not commits or not self.repo or self.busy or self.picking:
@@ -873,7 +923,7 @@ class Window(QMainWindow):
         self.error_msg.hide()
         self.log(f"--- cherry-picking {len(commits)} commit(s) onto new branch {branch} (from origin/{target})")
         self.set_status(f"Creating {branch}…")
-        self.run_bg(lambda: self.repo.start_branch(target, branch), lambda _: self.pick_next(),
+        self.run_bg(lambda: self.repo.new_branch(target, branch), lambda _: self.pick_next(),
                     lambda e: (self.end_picking(), self.error(e)))
 
     def pick_next(self):
@@ -975,6 +1025,323 @@ class Window(QMainWindow):
 
     def on_open_pr(self):
         url = self.repo and self.repo.compare_url(self.last_target, self.last_branch)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    # ------------------------------------------------------------ promote tab
+    def build_promote_tab(self, spacing):
+        tab = self.promote_tab = QWidget()
+        i = self.tabs.addTab(tab, icon("vcs-merge", "merge", "go-up"), "Promote")
+        self.tabs.setTabToolTip(i, "Merge a whole branch into another, e.g. main into a stable branch")
+        root = QVBoxLayout(tab)
+
+        row = QHBoxLayout()
+        src_lbl = QLabel("Promote:")
+        row.addWidget(src_lbl)
+        self.p_src_combo = searchable_combo()
+        self.p_src_combo.setToolTip("Branch whose commits are merged in (usually main)")
+        src_lbl.setBuddy(self.p_src_combo)
+        row.addWidget(self.p_src_combo)
+        dst_lbl = QLabel("Into:")
+        row.addWidget(dst_lbl)
+        self.p_dst_combo = searchable_combo()
+        self.p_dst_combo.setToolTip("Branch that receives them, e.g. a stable branch")
+        dst_lbl.setBuddy(self.p_dst_combo)
+        row.addWidget(self.p_dst_combo)
+        row.addStretch(1)
+        for cb in (self.p_src_combo, self.p_dst_combo):
+            cb.activated.connect(lambda _i: self.on_promote_branches_changed())
+            cb.lineEdit().returnPressed.connect(self.on_promote_branches_changed)
+        root.addLayout(row)
+
+        split = self.p_split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        self.p_stack = QStackedWidget()
+        self.p_placeholder = Placeholder()
+        self.p_stack.addWidget(self.p_placeholder)
+        self.p_tree = QTreeWidget()
+        self.p_tree.setHeaderLabels(["Hash", "Subject", "PR", "Author", "Date"])
+        self.p_tree.setRootIsDecorated(False)
+        self.p_tree.setUniformRowHeights(True)
+        self.p_tree.setAlternatingRowColors(True)
+        hdr = self.p_tree.header()
+        hdr.setStretchLastSection(False)
+        for col, mode in ((P_SHA, QHeaderView.ResizeMode.ResizeToContents),
+                          (P_SUBJECT, QHeaderView.ResizeMode.Stretch),
+                          (P_PR, QHeaderView.ResizeMode.ResizeToContents),
+                          (P_AUTHOR, QHeaderView.ResizeMode.Interactive),
+                          (P_DATE, QHeaderView.ResizeMode.ResizeToContents)):
+            hdr.setSectionResizeMode(col, mode)
+        self.p_tree.setColumnWidth(P_AUTHOR, 140)
+        self.p_tree.currentItemChanged.connect(self.on_promote_current_changed)
+        self.p_stack.addWidget(self.p_tree)
+        lv.addWidget(self.p_stack, 1)
+        self.p_summary = QLabel()
+        self.p_summary.setEnabled(False)
+        lv.addWidget(self.p_summary)
+        split.addWidget(left)
+        self.p_diff = QPlainTextEdit()
+        self.p_diff.setReadOnly(True)
+        self.p_diff.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.p_diff.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.p_diff.setPlaceholderText("Select a commit to see its changes")
+        self.p_highlighter = DiffHighlighter(self.p_diff.document())
+        split.addWidget(self.p_diff)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        root.addWidget(split, 1)
+
+        # merge conflict message
+        m = self.p_conflict_msg = MessageWidget("warning")
+        self.p_editor_btn = m.add_button(push_button("Open in Editor", self.open_conflicts_in_editor,
+                                                     "Open the conflicted files", ("document-edit",)))
+        m.add_button(push_button("Open Folder", self.open_folder, "Open the working copy in the file manager",
+                                 ("document-open-folder", "folder-open")))
+        m.add_button(push_button("Take Incoming", lambda: self.on_promote_resolve("theirs"),
+                                 "Resolve every conflicted file with the version from the promoted branch",
+                                 ("go-next",)))
+        m.add_button(push_button("Keep Target", lambda: self.on_promote_resolve("ours"),
+                                 "Resolve every conflicted file with the target branch version", ("go-previous",)))
+        m.add_stretch()
+        m.add_button(push_button("Abort Merge", self.on_promote_abort, "Give up on this merge",
+                                 ("process-stop",)))
+        self.p_commit_btn = m.add_button(push_button("Commit Merge", self.on_promote_commit,
+                                                     "Commit the merge with the resolved files", ("dialog-ok-apply",)))
+        self.p_conflict_btns = [m.buttons.itemAt(i).widget() for i in range(m.buttons.count())
+                                if isinstance(m.buttons.itemAt(i).widget(), QPushButton)]
+        root.addWidget(m)
+
+        # result message
+        r = self.p_result_msg = MessageWidget("positive", closable=True)
+        r.add_button(push_button("Open Folder", self.open_folder, icons=("document-open-folder", "folder-open")))
+        self.p_push_btn = r.add_button(push_button("Push", self.on_promote_push, "Push the branch to GitHub",
+                                                   ("cloud-upload", "go-up")))
+        self.p_pr_btn = r.add_button(push_button("Create Pull Request…", self.on_promote_pr,
+                                                 "Open GitHub to create the pull request",
+                                                 ("vcs-merge-request", "internet-web-browser")))
+        r.add_stretch()
+        root.addWidget(r)
+
+        # bottom: branch, fork, push option, primary action
+        row = QHBoxLayout()
+        br_lbl = QLabel("New branch:")
+        row.addWidget(br_lbl)
+        self.p_branch_edit = QLineEdit()
+        self.p_branch_edit.setMinimumWidth(300)
+        self.p_branch_edit.setToolTip("Branch created from the target to hold the merge")
+        self.p_branch_edit.textEdited.connect(lambda t: setattr(self, "p_branch_auto", not t.strip()))
+        br_lbl.setBuddy(self.p_branch_edit)
+        row.addWidget(self.p_branch_edit)
+        row.addSpacing(spacing * 2)
+        fork_lbl = QLabel("Push to fork:")
+        row.addWidget(fork_lbl)
+        self.p_fork_edit = QLineEdit()
+        self.p_fork_edit.setMinimumWidth(220)
+        self.p_fork_edit.setPlaceholderText("none: push to the repository")
+        self.p_fork_edit.setToolTip("Your fork (owner/repo or git URL) to push the branch to. "
+                                    "Leave empty to push to the loaded repository itself.")
+        fork_lbl.setBuddy(self.p_fork_edit)
+        row.addWidget(self.p_fork_edit)
+        row.addSpacing(spacing * 2)
+        self.p_push_cb = QCheckBox("Push when done")
+        self.p_push_cb.setChecked(self.cfg.get("promote_push", False))
+        row.addWidget(self.p_push_cb)
+        row.addStretch(1)
+        self.p_go_btn = push_button("Promote", self.on_promote,
+                                    "Fetch, create the branch and merge (Ctrl+Return)",
+                                    ("vcs-merge", "merge", "dialog-ok-apply"))
+        row.addWidget(self.p_go_btn)
+        root.addLayout(row)
+        self.set_p_placeholder()
+
+    def p_source(self):
+        return self.p_src_combo.currentText().strip()
+
+    def p_target(self):
+        return self.p_dst_combo.currentText().strip()
+
+    def set_p_placeholder(self, icons=("vcs-branch", "folder-git", "git"), title="No repository loaded",
+                          explanation="Enter a GitHub repository above and press Load."):
+        self.p_placeholder.set(icons, title, explanation)
+        self.p_stack.setCurrentWidget(self.p_placeholder)
+
+    def clear_promote(self):
+        self.p_tree.clear()
+        self.p_diff.clear()
+        self.p_summary.setText("")
+        self.p_total = 0
+        self.p_go_btn.setText("Promote")
+        self.update_sensitivity()
+
+    def on_promote_branches_changed(self):
+        self.p_branch_auto = True  # the suggested name follows the branches
+        self.load_promote()
+
+    def load_promote(self):
+        if not self.repo:
+            return
+        src, dst = self.p_source(), self.p_target()
+        branches = [self.p_src_combo.itemText(i) for i in range(self.p_src_combo.count())]
+        if src not in branches or dst not in branches:
+            return
+        self.clear_promote()
+        if self.p_branch_auto:
+            self.p_branch_edit.setText(promote_branch_name(src, dst))
+        if src == dst:
+            self.set_p_placeholder(("vcs-branch", "dialog-information"), "Pick two different branches", "")
+            return
+        self.cfg.setdefault("repos", {}).setdefault(self.repo.spec, {}).setdefault("promote", {}).update(
+            source=src, target=dst)
+        save_config(self.cfg)
+        self.set_p_placeholder(("view-history", "document-open-recent"), "Loading commits…", "")
+        repo = self.repo
+
+        def done(res):
+            if (self.p_source(), self.p_target()) != (src, dst) or repo is not self.repo:
+                return  # selection changed meanwhile
+            commits, total, stat = res
+            mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+            for c in commits:
+                pr = pr_from_subject(c["subject"])
+                it = QTreeWidgetItem([c["short"], c["subject"], f"#{pr}" if pr else "", c["author"], c["date"]])
+                it.commit = c
+                it.setFont(P_SHA, mono)
+                it.setToolTip(P_SUBJECT, c["subject"] + ("\nMerge commit" if c["merge"] else ""))
+                self.p_tree.addTopLevelItem(it)
+            self.p_total = total
+            if total:
+                txt = f"{total} commit{'s' if total != 1 else ''} on {src} not yet in {dst}"
+                if total > len(commits):
+                    txt += f" (newest {len(commits)} shown)"
+                self.p_summary.setText(txt + (f" · {stat}" if stat else ""))
+                self.p_go_btn.setText(f"Promote {total} Commit{'s' if total != 1 else ''}")
+                self.p_stack.setCurrentWidget(self.p_tree)
+            else:
+                self.set_p_placeholder(("checkmark", "dialog-ok"), "Nothing to promote",
+                                       f"{dst} already has everything on {src}.")
+            self.update_sensitivity()
+        self.run_bg(lambda: repo.promote_commits(dst, src), done,
+                    lambda e: (self.set_p_placeholder(("dialog-error",), "Could not list commits", ""),
+                               self.error(e)))
+
+    def on_promote_current_changed(self, item, _prev):
+        if item is None or not self.repo:
+            return
+        self.p_diff_req += 1
+        req, repo, sha = self.p_diff_req, self.repo, item.commit["sha"]
+
+        def work():
+            try:
+                text = repo.show(sha)
+            except GitError as e:
+                text = str(e)
+            self.bridge.call.emit(lambda: req == self.p_diff_req and self.p_diff.setPlainText(text))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_promote(self):
+        if not self.repo or self.busy or self.picking or not self.p_go_btn.isEnabled():
+            return
+        repo, src, dst = self.repo, self.p_source(), self.p_target()
+        branch = self.p_branch_edit.text().strip() or promote_branch_name(src, dst)
+        fork = self.p_fork_edit.text().strip()
+        self.cfg.setdefault("repos", {}).setdefault(repo.spec, {}).setdefault("promote", {})["fork"] = fork
+        self.cfg["promote_push"] = self.p_push_cb.isChecked()
+        save_config(self.cfg)
+        self.p_last = dict(source=src, target=dst, branch=branch, fork=fork)
+        self.picking = True  # a git operation owns the working copy until it ends
+        self.p_result_msg.hide()
+        self.error_msg.hide()
+        self.log(f"--- promoting origin/{src} into new branch {branch} (from origin/{dst})")
+        self.set_status(f"Fetching, then merging {src} into {branch}…")
+
+        def work():
+            repo.fetch()
+            repo.new_branch(dst, branch)
+            return repo.merge(src)
+        self.run_bg(work, self.after_promote_merge, lambda e: (self.end_picking(), self.error(e)))
+
+    def after_promote_merge(self, result):
+        if result == "conflict":
+            self.run_bg(self.repo.conflicts, self.show_promote_conflict)
+        else:
+            self.finish_promote(result)
+
+    def show_promote_conflict(self, files):
+        self.conflict_files = files
+        p = self.p_last
+        self.set_status(f"Merge conflicts in {len(files)} file{'s' if len(files) != 1 else ''}")
+        esc = html.escape
+        listing = "<br>".join(f"&nbsp;&nbsp;•&nbsp;<tt>{esc(f)}</tt>" for f in files)
+        self.p_conflict_msg.show_message(
+            "warning",
+            f"<b>Conflicts while merging {esc(p['source'])} into <tt>{esc(p['branch'])}</tt></b><br>{listing}<br>"
+            "Resolve the conflicts and press <b>Commit Merge</b>, or settle every file one way with "
+            f"<i>Take Incoming</i> ({esc(p['source'])}) or <i>Keep Target</i> ({esc(p['target'])}).")
+        self.p_commit_btn.setDefault(True)
+        self.p_commit_btn.setFocus()
+        if self.auto_editor_act.isChecked():
+            self.open_conflicts_in_editor()
+
+    def on_promote_resolve(self, side):
+        repo = self.repo
+        self.run_bg(lambda: (repo.resolve_all(side), repo.commit_merge()), lambda _: self.finish_promote("ok"))
+
+    def on_promote_commit(self):
+        self.run_bg(self.repo.commit_merge, lambda _: self.finish_promote("ok"))
+
+    def on_promote_abort(self):
+        def done(_):
+            self.end_picking()
+            p = self.p_last
+            self.p_result_msg.show_message(
+                "information", f"Merge aborted. <tt>{html.escape(p['branch'])}</tt> is left at "
+                               f"<tt>origin/{html.escape(p['target'])}</tt>.")
+            self.p_push_btn.hide()
+            self.p_pr_btn.hide()
+            self.set_status("Merge aborted")
+        self.run_bg(self.repo.abort_merge, done)
+
+    def finish_promote(self, result):
+        self.end_picking()
+        self.p_conflict_msg.hide()
+        p, esc = self.p_last, html.escape
+        self.p_pr_btn.hide()
+        if result == "uptodate":
+            self.p_result_msg.show_message("information", f"Nothing to merge: {esc(p['target'])} already has "
+                                                          f"everything on {esc(p['source'])}.")
+            self.p_push_btn.hide()
+            self.set_status("Already up to date")
+            return
+        self.p_result_template = (f"<b>Merged {esc(p['source'])}</b> into <tt>{esc(p['branch'])}</tt> "
+                                  f"(%STATE%), ready for a pull request into <tt>{esc(p['target'])}</tt>.")
+        self.p_result_msg.show_message("positive", self.p_result_template.replace("%STATE%", "local"))
+        self.p_push_btn.show()
+        self.p_branch_auto = True
+        self.set_status("Merged")
+        if self.p_push_cb.isChecked():
+            self.on_promote_push()
+
+    def on_promote_push(self):
+        p, repo = self.p_last, self.repo
+        if not p or not repo:
+            return
+        where = p["fork"] or "the repository"
+        self.set_status(f"Pushing {p['branch']} to {where}…")
+
+        def done(_):
+            self.set_status(f"Pushed {p['branch']}")
+            state = f"pushed to {html.escape(p['fork'])}" if p["fork"] else "pushed"
+            self.p_result_msg.text.setText(self.p_result_template.replace("%STATE%", state))
+            self.p_push_btn.hide()
+            self.p_pr_btn.setVisible(repo.compare_url(p["target"], p["branch"], p["fork"]) is not None)
+        self.run_bg(lambda: repo.push(p["branch"], p["fork"] or None), done)
+
+    def on_promote_pr(self):
+        p = self.p_last
+        url = self.repo and p and self.repo.compare_url(p["target"], p["branch"], p["fork"])
         if url:
             QDesktopServices.openUrl(QUrl(url))
 
