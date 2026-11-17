@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -18,6 +19,7 @@ CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) /
 COMMIT_LIMIT = 1000
 DIFF_LIMIT = 300_000
 PICKED_RE = re.compile(r"cherry picked from commit ([0-9a-f]{40})")
+SEQ_HEAD = {"cherry-pick": "CHERRY_PICK_HEAD", "revert": "REVERT_HEAD"}
 PR_SUBJECT_RE = re.compile(r"\(#(\d+)\)\s*$|^Merge pull request #(\d+)")
 # (label, command) - only the ones installed are offered; the first one is the default
 EDITORS = [("Zed", "zed"), ("Kate", "kate"), ("KWrite", "kwrite"), ("GNOME Text Editor", "gnome-text-editor"),
@@ -28,6 +30,10 @@ SYSTEM_DEFAULT = "System default"
 
 class GitError(Exception):
     pass
+
+
+class PushRejected(GitError):
+    """The branch already exists on the remote with commits the local one doesn't have."""
 
 
 def parse_repo(text):
@@ -65,6 +71,39 @@ def gh_authenticated():
     return _gh_ok
 
 
+def github_api(path):
+    """GET from the GitHub REST API: through `gh` when logged in, else anonymously (public repos only)."""
+    try:
+        if gh_authenticated():
+            p = subprocess.run(["gh", "api", path], capture_output=True, timeout=20)
+            if p.returncode == 0:
+                return json.loads(p.stdout)
+            raise GitError(f"GitHub API {path}: {p.stderr.decode('utf-8', 'replace').strip()}")
+        req = urllib.request.Request(f"https://api.github.com/{path}",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "cherry-picker"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise GitError(f"GitHub API {path}: {e.code} {e.reason}") from e
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise GitError(f"Could not reach GitHub: {e}") from e
+
+
+def parse_pr(text):
+    """123, #123 or a .../pull/123 URL -> 123."""
+    m = re.fullmatch(r"\s*(?:#?(\d+)|https?://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)\S*)\s*", text)
+    if not m:
+        raise GitError("Enter a pull request number (e.g. 123 or #123) or its GitHub URL.")
+    return int(m.group(1) or m.group(2))
+
+
+def revert_branch_name(branch, commits, now=None):
+    """revert-<pr>[-<pr>...]-on-<branch>, else the short hashes, e.g. revert-123-on-main."""
+    prs = [n for c in commits if (n := pr_from_subject(c["subject"]))]
+    ids = list(dict.fromkeys(map(str, prs))) if prs else [c["short"] for c in commits[:3]]
+    return f"revert-{'-'.join(ids) or f'{(now or datetime.datetime.now()):%Y%m%d-%H%M}'}-on-{branch}"
+
+
 class Repo:
     def __init__(self, spec, log):
         self.spec = spec.strip()
@@ -95,6 +134,8 @@ class Repo:
             if "could not read Username" in msg or "Authentication failed" in msg:
                 msg += ("\n\nThis repository needs authentication. Run `gh auth login` in a terminal "
                         "(or set up SSH keys and use the git@github.com:owner/repo URL).")
+            if args[0] == "push" and re.search(r"\[rejected\].*\((non-fast-forward|fetch first)\)", msg):
+                raise PushRejected(f"git push was rejected:\n{msg}")
             raise GitError(f"git {args[0]} failed:\n{msg}")
         p.out, p.err = out, err
         return p
@@ -102,18 +143,25 @@ class Repo:
     def out(self, args, **kw):
         return self.run(args, quiet=True, **kw).out
 
-    def in_pick(self):
-        return (self.path / ".git" / "CHERRY_PICK_HEAD").exists()
+    def in_pick(self, op="cherry-pick"):
+        """True while a cherry-pick (or, with op="revert", a revert) is stopped."""
+        return (self.path / ".git" / SEQ_HEAD[op]).exists()
 
     def in_merge(self):
         return (self.path / ".git" / "MERGE_HEAD").exists()
 
+    def in_rebase(self):
+        return any((self.path / ".git" / d).exists() for d in ("rebase-merge", "rebase-apply"))
+
     def abort_unfinished(self):
-        """Drop a cherry-pick or merge left half-done (e.g. the app was closed during a conflict)."""
-        if self.in_pick():
-            self.run(["cherry-pick", "--abort"], check=False)
+        """Drop a cherry-pick, revert, merge or rebase left half-done (e.g. the app was closed mid-conflict)."""
+        for op in SEQ_HEAD:
+            if self.in_pick(op):
+                self.run([op, "--abort"], check=False)
         if self.in_merge():
             self.run(["merge", "--abort"], check=False)
+        if self.in_rebase():
+            self.run(["rebase", "--abort"], check=False)
 
     # -- repository
     def sync(self):
@@ -175,24 +223,29 @@ class Repo:
     def head(self):
         return self.out(["rev-parse", "HEAD"]).strip()
 
-    def pick(self, sha, record_origin, merge):
+    def pick(self, sha, record_origin, merge, op="cherry-pick"):
+        """Apply (op="cherry-pick") or undo (op="revert") one commit: "ok", "dropped" or "conflict"."""
         before = self.head()
-        args = ["cherry-pick", "--allow-empty", "--empty=drop"]
-        if record_origin:
-            args.append("-x")
+        if op == "revert":
+            args = ["revert", "--no-edit"]
+        else:
+            args = ["cherry-pick", "--allow-empty", "--empty=drop"]
+            if record_origin:
+                args.append("-x")
         if merge:
             args += ["-m", "1"]
         p = self.run(args + [sha], check=False)
         if p.returncode == 0:
             return "ok" if self.head() != before else "dropped"
-        if self.in_pick():
+        if self.in_pick(op):
             if self.conflicts():
                 return "conflict"
-            if self.nothing_staged():  # stopped because the changes are already on the branch
-                self.run(["cherry-pick", "--skip"])
+            if self.nothing_staged():  # stopped because there is nothing to change (already applied / undone)
+                self.run([op, "--skip"])
                 return "dropped"
-            self.run(["cherry-pick", "--abort"], check=False)  # e.g. the commit itself failed
-        raise GitError(f"Cherry-pick of {sha[:10]} failed:\n{(p.err or p.out).strip()}")
+            self.run([op, "--abort"], check=False)  # e.g. the commit itself failed
+        what = "Revert" if op == "revert" else "Cherry-pick"
+        raise GitError(f"{what} of {sha[:10]} failed:\n{(p.err or p.out).strip()}")
 
     def nothing_staged(self):
         return self.run(["diff", "--cached", "--quiet"], check=False, quiet=True).returncode == 0
@@ -219,55 +272,162 @@ class Repo:
                     marked.append(f)
         if marked:
             raise GitError("Conflict markers are still present in:\n  " + "\n  ".join(marked) +
-                           f"\n\nEdit those files (or use Take Incoming / Keep Target), then press {button}.")
+                           f"\n\nEdit those files, or settle every file one way with the buttons next to {button}.")
         if files:
             self.run(["add", "-A", "--"] + files)
 
-    def continue_pick(self):
+    def continue_pick(self, op="cherry-pick"):
         self.stage_resolved()
-        before = self.out(["rev-parse", "HEAD"]).strip()
-        p = self.run(["cherry-pick", "--continue"], check=False)
+        before = self.head()
+        p = self.run([op, "--continue"], check=False)
         if p.returncode:
-            if self.in_pick() and not self.conflicts() and self.nothing_staged():  # resolution left no changes
-                self.run(["cherry-pick", "--skip"])
+            if self.in_pick(op) and not self.conflicts() and self.nothing_staged():  # resolution left no changes
+                self.run([op, "--skip"])
                 return "dropped"
-            raise GitError(f"cherry-pick --continue failed:\n{(p.err or p.out).strip()}")
+            raise GitError(f"{op} --continue failed:\n{(p.err or p.out).strip()}")
         return "ok" if self.head() != before else "dropped"
 
-    def skip(self):
-        self.run(["cherry-pick", "--skip"])
+    def skip(self, op="cherry-pick"):
+        self.run([op, "--skip"])
 
-    def abort(self):
-        if self.in_pick():
-            self.run(["cherry-pick", "--abort"])
+    def abort(self, op="cherry-pick"):
+        if self.in_pick(op):
+            self.run([op, "--abort"])
 
-    def push(self, branch, fork=None):
-        """Push to this repository, or to `fork` (owner/repo or a git URL) through a `fork` remote."""
-        if not fork:
-            self.run(["push", "-u", "origin", f"{branch}:{branch}"])
-            return
-        url, _slug, _name = parse_repo(fork)
-        if self.run(["remote", "get-url", "fork"], check=False, quiet=True).returncode:
-            self.run(["remote", "add", "fork", url])
+    # -- reverting
+    def log_commits(self, *args):
+        """`git log <args>` as commit dicts, newest first."""
+        out = self.out(["log", f"--max-count={COMMIT_LIMIT}", "--date=short",
+                        "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%P%x1f%s", *args, "--"])
+        result = []
+        for line in out.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) == 6:
+                sha, short, author, date, parents, subject = parts
+                result.append(dict(sha=sha, short=short, author=author, date=date, subject=subject,
+                                   merge=len(parents.split()) > 1, applied=False))
+        return result
+
+    def branch_commits(self, branch):
+        """Changes that landed on origin/<branch>, newest first (first parent: one row per merged PR)."""
+        return self.log_commits("--first-parent", f"origin/{branch}")
+
+    # -- rebasing a pull request onto its base
+    def pr_info(self, number):
+        """The pull request from the GitHub API, plus its commits fetched into refs/pr/<number>."""
+        if not self.slug:
+            raise GitError("Rebasing a pull request needs a GitHub repository (owner/repo).")
+        data = github_api(f"repos/{self.slug}/pulls/{number}")
+        if not isinstance(data, dict) or "head" not in data:
+            raise GitError(f"Could not find pull request #{number} in {self.slug}.")
+        head_repo = data["head"].get("repo") or {}
+        info = dict(number=number, title=data.get("title", ""), author=(data.get("user") or {}).get("login", "?"),
+                    state="merged" if data.get("merged_at") else data.get("state", "open"),
+                    draft=bool(data.get("draft")), base=data["base"]["ref"], head=data["head"]["ref"],
+                    head_sha=data["head"]["sha"], head_repo=head_repo.get("full_name"),
+                    head_ssh=head_repo.get("ssh_url"), head_https=head_repo.get("clone_url"),
+                    can_modify=bool(data.get("maintainer_can_modify")),
+                    url=data.get("html_url") or f"https://github.com/{self.slug}/pull/{number}")
+        info["same_repo"] = (info["head_repo"] or "").lower() == self.slug.lower()
+        self.fetch()
+        self.run(["fetch", "--no-tags", "origin", f"+refs/pull/{number}/head:refs/pr/{number}"])
+        info["fetched_sha"] = self.out(["rev-parse", f"refs/pr/{number}"]).strip()
+        rng = f"origin/{info['base']}..refs/pr/{number}"
+        info["commits"] = self.log_commits("--topo-order", rng)
+        info["behind"] = int(self.out(["rev-list", "--count", f"refs/pr/{number}..origin/{info['base']}"]).strip())
+        return info
+
+    def start_rebase(self, info):
+        """Check out the PR head and rebase it onto origin/<base>: "ok", "uptodate" or "conflict"."""
+        self.abort_unfinished()
+        branch = f"pr-{info['number']}"
+        self.run(["checkout", "-f", "-B", branch, f"refs/pr/{info['number']}"])
+        self.run(["clean", "-fdq"])
+        base = f"origin/{info['base']}"
+        if self.run(["merge-base", "--is-ancestor", base, "HEAD"], check=False, quiet=True).returncode == 0:
+            return "uptodate"
+        p = self.run(["rebase", base], check=False)
+        return self._rebase_state(p)
+
+    def _rebase_state(self, p):
+        if p.returncode == 0 and not self.in_rebase():
+            return "ok"
+        if self.in_rebase() and self.conflicts():
+            return "conflict"
+        if self.in_rebase():
+            self.run(["rebase", "--abort"], check=False)
+        raise GitError(f"git rebase failed:\n{(p.err or p.out).strip()}")
+
+    def rebase_step(self):
+        """(position, total, short sha, subject) of the commit the rebase stopped on."""
+        d = self.path / ".git" / "rebase-merge"
+        try:
+            pos, total = int((d / "msgnum").read_text()), int((d / "end").read_text())
+        except (OSError, ValueError):
+            pos = total = 0
+        p = self.run(["log", "-1", "--format=%h%x1f%s", "REBASE_HEAD"], check=False, quiet=True)
+        short, _, subject = p.out.strip().partition("\x1f")
+        return pos, total, short, subject
+
+    def rebase_continue(self):
+        self.stage_resolved()
+        if not self.conflicts() and self.nothing_staged() and self.in_rebase():
+            p = self.run(["rebase", "--skip"], check=False)  # resolution left no changes: drop the commit
         else:
-            self.run(["remote", "set-url", "fork", url])
-        self.run(["push", "-u", "fork", f"{branch}:{branch}"],
-                 use_gh=url.startswith("https://github.com/") and gh_authenticated())
+            p = self.run(["rebase", "--continue"], check=False)
+        return self._rebase_state(p)
+
+    def rebase_skip(self):
+        return self._rebase_state(self.run(["rebase", "--skip"], check=False))
+
+    def rebase_abort(self):
+        if self.in_rebase():
+            self.run(["rebase", "--abort"])
+
+    def push_pr(self, info):
+        """Force-push the rebased branch to the PR's head branch, only if it still is what we fetched."""
+        if info["same_repo"]:
+            remote, use_gh = "origin", None
+        else:
+            if not info["head_repo"]:
+                raise GitError("The pull request's fork no longer exists, so it can't be pushed to.")
+            remote = info["head_ssh"] if self.url.startswith("git@") else info["head_https"]
+            use_gh = remote.startswith("https://github.com/") and gh_authenticated()
+        ref = f"refs/heads/{info['head']}"
+        p = self.run(["push", f"--force-with-lease={ref}:{info['fetched_sha']}", remote, f"HEAD:{ref}"],
+                     check=False, use_gh=use_gh)
+        if p.returncode:
+            msg = (p.err or p.out).strip()
+            if "stale info" in msg or "fetch first" in msg:
+                raise GitError(f"Nothing was pushed: pull request #{info['number']} changed on GitHub after you "
+                               "looked it up. Look it up again and redo the rebase.\n\n" + msg)
+            raise GitError(f"git push failed:\n{msg}")
+
+    def push(self, branch, fork=None, replace=False):
+        """Push to this repository, or to `fork` (owner/repo or a git URL) through a `fork` remote.
+
+        Raises PushRejected when the branch already exists there with other commits. With replace=True
+        it is overwritten, but only if it still points where it did a moment ago (--force-with-lease).
+        """
+        remote, use_gh = "origin", None
+        if fork:
+            url, _slug, _name = parse_repo(fork)
+            if self.run(["remote", "get-url", "fork"], check=False, quiet=True).returncode:
+                self.run(["remote", "add", "fork", url])
+            else:
+                self.run(["remote", "set-url", "fork", url])
+            remote, use_gh = "fork", url.startswith("https://github.com/") and gh_authenticated()
+        args = ["push", "-u"]
+        if replace:
+            ref = f"refs/heads/{branch}"
+            old = self.out(["ls-remote", remote, ref], use_gh=use_gh).split()
+            args.append(f"--force-with-lease={ref}:{old[0]}" if old else f"--force-with-lease={ref}:")
+        self.run(args + [remote, f"{branch}:{branch}"], use_gh=use_gh)
 
     # -- promoting (merge a whole branch into another)
     def promote_commits(self, target, source):
         """Commits a merge of origin/<source> would bring into origin/<target>, newest first."""
-        out = self.out(["log", "--topo-order", f"--max-count={COMMIT_LIMIT}", "--date=short",
-                        "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%P%x1f%s",
-                        f"origin/{target}..origin/{source}", "--"])
-        result = []
-        for line in out.splitlines():
-            parts = line.split("\x1f")
-            if len(parts) != 6:
-                continue
-            sha, short, author, date, parents, subject = parts
-            result.append(dict(sha=sha, short=short, author=author, date=date, subject=subject,
-                               merge=len(parents.split()) > 1, applied=False))
+        result = self.log_commits("--topo-order", f"origin/{target}..origin/{source}")
         total = int(self.out(["rev-list", "--count", f"origin/{target}..origin/{source}", "--"]).strip() or 0)
         stat = self.out(["diff", "--shortstat", f"origin/{target}...origin/{source}", "--"]).strip()
         return result, total, stat
@@ -303,20 +463,9 @@ class Repo:
         sha = commit["sha"]
         if sha in self.pr_cache:
             return self.pr_cache[sha]
-        path = f"repos/{self.slug}/commits/{sha}/pulls"
-        data = None
         try:
-            if gh_authenticated():
-                p = subprocess.run(["gh", "api", path], capture_output=True, timeout=20)
-                if p.returncode == 0:
-                    data = json.loads(p.stdout)
-            else:  # public repos work without auth (rate limited)
-                req = urllib.request.Request(f"https://api.github.com/{path}",
-                                             headers={"Accept": "application/vnd.github+json",
-                                                      "User-Agent": "cherry-picker"})
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    data = json.loads(r.read())
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+            data = github_api(f"repos/{self.slug}/commits/{sha}/pulls")
+        except GitError:
             return None  # don't cache failures; maybe offline
         prs = data if isinstance(data, list) else []
         merged = [p for p in prs if p.get("merged_at")]

@@ -4,19 +4,21 @@ import html
 import shlex
 import sys
 import threading
+from types import SimpleNamespace
 
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
                            QKeySequence, QSyntaxHighlighter, QTextCharFormat)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter,
                                QDockWidget, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-                               QMenu, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
+                               QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
                                QStackedWidget, QStyle, QTabWidget, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
 from . import __version__
-from .core import (COMMIT_LIMIT, GitError, Repo, branch_name, editor_args, editor_icon_path, guess_promote_target,
-                   installed_editors, launch, load_config, pr_from_subject, promote_branch_name, save_config)
+from .core import (COMMIT_LIMIT, GitError, PushRejected, Repo, branch_name, editor_args, editor_icon_path, guess_promote_target,
+                   installed_editors, launch, load_config, parse_pr, pr_from_subject, promote_branch_name,
+                   revert_branch_name, save_config)
 
 COL_CHECK, COL_SHA, COL_SUBJECT, COL_PR, COL_AUTHOR, COL_DATE = range(6)
 P_SHA, P_SUBJECT, P_PR, P_AUTHOR, P_DATE = range(5)  # columns of the Promote tab's list
@@ -171,6 +173,63 @@ def push_button(text, cb, tooltip=None, icons=()):
     return b
 
 
+class Sequence(SimpleNamespace):
+    """A tab that runs commits through `git cherry-pick` / `git revert`: its op, widgets and last result."""
+    branch = target = None
+    template = ""
+
+
+def message_buttons(msg):
+    return [msg.buttons.itemAt(i).widget() for i in range(msg.buttons.count())
+            if isinstance(msg.buttons.itemAt(i).widget(), QPushButton)]
+
+
+def commit_tree(checkable):
+    """Commit list: [check,] hash, subject, PR, author, date (COL_* when checkable, else shifted by one)."""
+    tree = QTreeWidget()
+    labels = ["Hash", "Subject", "PR", "Author", "Date"]
+    tree.setHeaderLabels([""] + labels if checkable else labels)
+    tree.setRootIsDecorated(False)
+    tree.setUniformRowHeights(True)
+    tree.setAlternatingRowColors(True)
+    hdr = tree.header()
+    hdr.setStretchLastSection(False)
+    off = 0 if checkable else -1
+    modes = {COL_CHECK: QHeaderView.ResizeMode.ResizeToContents, COL_SHA: QHeaderView.ResizeMode.ResizeToContents,
+             COL_SUBJECT: QHeaderView.ResizeMode.Stretch, COL_PR: QHeaderView.ResizeMode.ResizeToContents,
+             COL_AUTHOR: QHeaderView.ResizeMode.Interactive, COL_DATE: QHeaderView.ResizeMode.ResizeToContents}
+    for col, mode in modes.items():
+        if col + off >= 0:
+            hdr.setSectionResizeMode(col + off, mode)
+    tree.setColumnWidth(COL_AUTHOR + off, 140)
+    return tree
+
+
+def commit_item(c, checkable):
+    pr = pr_from_subject(c["subject"])
+    cols = [c["short"], c["subject"], f"#{pr}" if pr else "", c["author"], c["date"]]
+    it = QTreeWidgetItem([""] + cols if checkable else cols)
+    it.commit = c
+    off = 0 if checkable else -1
+    if checkable:
+        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        it.setCheckState(COL_CHECK, Qt.CheckState.Unchecked)
+    it.setFont(COL_SHA + off, QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+    it.setToolTip(COL_SUBJECT + off, c["subject"] + ("\nMerge commit: handled against its first parent"
+                                                     if c["merge"] else ""))
+    return it
+
+
+def diff_view():
+    view = QPlainTextEdit()
+    view.setReadOnly(True)
+    view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+    view.setPlaceholderText("Select a commit to see its changes")
+    view.highlighter = DiffHighlighter(view.document())
+    return view
+
+
 def searchable_combo(min_width=240):
     """A branch picker you can type into to filter (contains-match)."""
     cb = QComboBox()
@@ -196,13 +255,13 @@ class Window(QMainWindow):
         self.suggested_prs = []
         self.conflict_files = []
         self.queue, self.qi, self.stats = [], 0, {}
-        self.last_branch = self.last_target = None
-        self.result_template = ""
         self.p_branch_auto = True
         self.p_total = 0  # commits the promote merge would bring in
         self.p_diff_req = 0
         self.p_last = {}  # source / target / branch / fork of the last promotion
         self.p_result_template = ""
+        self.r_branch_auto = True
+        self.cur = None  # Sequence of the cherry-pick / revert in progress or last run
         self.editors = installed_editors()
         spacing = self.style().pixelMetric(QStyle.PixelMetric.PM_LayoutHorizontalSpacing) or 6
 
@@ -382,9 +441,9 @@ class Window(QMainWindow):
         self.result_msg = MessageWidget("positive", closable=True)
         r = self.result_msg
         r.add_button(push_button("Open Folder", self.open_folder, icons=("document-open-folder", "folder-open")))
-        self.push_btn = r.add_button(push_button("Push", self.on_push, "Push the branch to GitHub",
+        self.push_btn = r.add_button(push_button("Push", lambda: self.on_push(self.seq_pick), "Push the branch to GitHub",
                                                  ("cloud-upload", "go-up")))
-        self.pr_btn = r.add_button(push_button("Create Pull Request…", self.on_open_pr,
+        self.pr_btn = r.add_button(push_button("Create Pull Request…", lambda: self.on_open_pr(self.seq_pick),
                                                "Open GitHub to create the pull request",
                                                ("vcs-merge-request", "internet-web-browser")))
         r.add_stretch()
@@ -415,8 +474,15 @@ class Window(QMainWindow):
         self.go_btn.setDefault(True)
         row.addWidget(self.go_btn)
         root.addLayout(row)
+        self.seq_pick = Sequence(op="cherry-pick", ing="picking", ed="picked", record_cb=self.x_cb,
+                                 sides="<i>Take Incoming</i> or <i>Keep Target</i>",
+                                 conflict_msg=self.conflict_msg, continue_btn=self.continue_btn,
+                                 result_msg=self.result_msg, push_btn=self.push_btn, pr_btn=self.pr_btn,
+                                 push_cb=self.push_cb, reset_branch_name=lambda: setattr(self, "branch_auto", True))
 
         self.build_promote_tab(spacing)
+        self.build_revert_tab(spacing)
+        self.build_rebase_tab()
 
         # ------------------------------------------------ git output dock
         self.log_dock = QDockWidget("Git Output", self)
@@ -437,7 +503,7 @@ class Window(QMainWindow):
         self.statusBar().addPermanentWidget(self.busy_bar)
 
         self.build_menu()
-        for seq, fn in (("Ctrl+Return", self.on_primary), (QKeySequence.StandardKey.Find, self.search.setFocus)):
+        for seq, fn in (("Ctrl+Return", self.on_primary), (QKeySequence.StandardKey.Find, self.on_find)):
             a = QAction(self)
             a.setShortcut(QKeySequence(seq))
             a.triggered.connect(fn)
@@ -448,7 +514,8 @@ class Window(QMainWindow):
 
         self.controls = [self.repo_combo, self.load_act, self.fetch_act, self.src_combo, self.dst_combo,
                          self.swap_btn, self.merges_act, self.branch_edit,
-                         self.p_src_combo, self.p_dst_combo, self.p_branch_edit, self.p_fork_edit]
+                         self.p_src_combo, self.p_dst_combo, self.p_branch_edit, self.p_fork_edit,
+                         self.r_branch_combo, self.r_branch_edit, self.b_pr_edit, self.b_lookup_btn]
         self.restore_layout()
         self.set_placeholder()
         self.update_editor_button()
@@ -506,10 +573,12 @@ class Window(QMainWindow):
                 self.split.restoreState(base64.b64decode(ui["split"]))
             else:
                 self.split.setSizes([650, 650])
-            if ui.get("promote_split"):
-                self.p_split.restoreState(base64.b64decode(ui["promote_split"]))
-            else:
-                self.p_split.setSizes([650, 650])
+            for key, split in (("promote_split", self.p_split), ("revert_split", self.r_split),
+                               ("rebase_split", self.b_split)):
+                if ui.get(key):
+                    split.restoreState(base64.b64decode(ui[key]))
+                else:
+                    split.setSizes([650, 650])
             self.tabs.setCurrentIndex(int(ui.get("tab", 0)))
         except (ValueError, TypeError):
             self.resize(1300, 850)
@@ -518,6 +587,7 @@ class Window(QMainWindow):
         enc = lambda b: base64.b64encode(bytes(b)).decode()  # noqa: E731
         self.cfg["ui"] = {"geometry": enc(self.saveGeometry()), "state": enc(self.saveState()),
                           "split": enc(self.split.saveState()), "promote_split": enc(self.p_split.saveState()),
+                          "revert_split": enc(self.r_split.saveState()), "rebase_split": enc(self.b_split.saveState()),
                           "tab": self.tabs.currentIndex()}
         save_config(self.cfg)
         super().closeEvent(event)
@@ -571,6 +641,14 @@ class Window(QMainWindow):
         for b in self.p_conflict_btns:
             b.setEnabled(self.busy == 0)
         self.p_push_btn.setEnabled(idle)
+        self.r_go_btn.setEnabled(idle and self.repo is not None and bool(self.r_selected()))
+        pr = self.b_pr
+        self.b_go_btn.setEnabled(idle and self.repo is not None and pr is not None
+                                 and pr["state"] == "open" and pr["behind"] > 0)
+        for b in self.r_conflict_btns + self.b_conflict_btns:
+            b.setEnabled(self.busy == 0)
+        self.seq_revert.push_btn.setEnabled(idle)
+        self.b_push_btn.setEnabled(idle)
         self.folder_act.setEnabled(self.repo is not None)
         self.busy_bar.setVisible(self.busy > 0)
 
@@ -714,6 +792,10 @@ class Window(QMainWindow):
         self.clear_promote()
         self.p_result_msg.hide()
         self.set_p_placeholder(("download", "folder-download"), "Loading repository…")
+        self.clear_reverts()
+        self.seq_revert.result_msg.hide()
+        self.set_r_placeholder(("download", "folder-download"), "Loading repository…")
+        self.clear_rebase()
         self.error_msg.hide()
         self.result_msg.hide()
         self.set_placeholder(("download", "folder-download"), "Loading repository…",
@@ -726,6 +808,7 @@ class Window(QMainWindow):
         self.set_placeholder(("dialog-error",), "Could not load the repository",
                              "Check the name and your access, then press Load again.")
         self.set_p_placeholder(("dialog-error",), "Could not load the repository")
+        self.set_r_placeholder(("dialog-error",), "Could not load the repository")
         self.error(e)
 
     def fill_branches(self, branches, source, target, combos=None):
@@ -737,6 +820,15 @@ class Window(QMainWindow):
             i = cb.findText(value) if value else -1
             cb.setCurrentIndex(i if i >= 0 else 0)
             cb.blockSignals(False)
+
+    def fill_revert_branches(self, branches, value):
+        cb = self.r_branch_combo
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItems(branches)
+        i = cb.findText(value) if value else -1
+        cb.setCurrentIndex(i if i >= 0 else 0)
+        cb.blockSignals(False)
 
     def on_loaded(self, repo, branches, default):
         self.repo = repo
@@ -754,10 +846,13 @@ class Window(QMainWindow):
         self.fill_branches(branches, p_src, p_dst, (self.p_src_combo, self.p_dst_combo))
         self.p_fork_edit.setText(pp.get("fork", ""))
         self.p_branch_auto = True
+        r_branch = prefs.get("revert", {}).get("branch")
+        self.fill_revert_branches(branches, r_branch if r_branch in branches else default)
         self.remember_recent(repo.spec)
         self.update_sensitivity()
         self.load_commits()
         self.load_promote()
+        self.load_reverts()
 
     def on_refresh(self):
         if not self.repo:
@@ -766,15 +861,18 @@ class Window(QMainWindow):
             return
         repo, src, dst = self.repo, self.source(), self.target()
         p_src, p_dst = self.p_source(), self.p_target()
+        r_branch = self.r_branch_combo.currentText().strip()
         self.set_status("Fetching…")
 
         def done(res):
             branches, _ = res
             self.fill_branches(branches, src, dst)
             self.fill_branches(branches, p_src, p_dst, (self.p_src_combo, self.p_dst_combo))
+            self.fill_revert_branches(branches, r_branch)
             self.set_status(f"{len(branches)} branches")
             self.load_commits()
             self.load_promote()
+            self.load_reverts()
         self.run_bg(repo.sync, done)
 
     def on_swap(self):
@@ -875,7 +973,7 @@ class Window(QMainWindow):
             ic = QIcon(path) if path else icon(cmd, {"zed": "dev.zed.Zed", "code": "visual-studio-code",
                                                      "kate": "org.kde.kate", "kwrite": "org.kde.kwrite"}
                                                .get(cmd, cmd), "document-edit")
-        for b in (self.editor_btn, self.p_editor_btn):
+        for b in (self.editor_btn, self.p_editor_btn, self.r_editor_btn, self.b_editor_btn):
             b.setText("Open in Editor" if cmd is None else f"Open in {name}")
             if ic:
                 b.setIcon(ic)
@@ -901,9 +999,15 @@ class Window(QMainWindow):
         except OSError as e:
             self.error(GitError(f"Could not start {name}: {e}"))
 
-    # ------------------------------------------------------------ cherry-picking
+    # ------------------------------------------------------------ cherry-picking / reverting
+    # Both run a queue of commits through `git cherry-pick` or `git revert`, one at a time, stopping on
+    # conflicts. `self.cur` is the Sequence of the tab doing it (its op, widgets and last result).
     def on_primary(self):  # Ctrl+Return
-        (self.on_promote if self.tabs.currentWidget() is self.promote_tab else self.on_go)()
+        {self.promote_tab: self.on_promote, self.revert_tab: self.on_revert,
+         self.rebase_tab: self.on_rebase}.get(self.tabs.currentWidget(), self.on_go)()
+
+    def on_find(self):  # Ctrl+F
+        (self.r_search if self.tabs.currentWidget() is self.revert_tab else self.search).setFocus()
 
     def on_go(self):
         commits = self.selected_commits()
@@ -915,13 +1019,17 @@ class Window(QMainWindow):
         self.cfg["record_origin"] = self.x_cb.isChecked()
         self.cfg["push"] = self.push_cb.isChecked()
         save_config(self.cfg)
+        self.start_sequence(self.seq_pick, commits, target, branch)
+
+    def start_sequence(self, seq, commits, target, branch):
+        self.cur = seq
         self.queue, self.qi = commits, 0
         self.stats = {"ok": [], "dropped": [], "skipped": []}
-        self.last_branch, self.last_target = branch, target
+        seq.branch, seq.target = branch, target
         self.picking = True
-        self.result_msg.hide()
+        seq.result_msg.hide()
         self.error_msg.hide()
-        self.log(f"--- cherry-picking {len(commits)} commit(s) onto new branch {branch} (from origin/{target})")
+        self.log(f"--- {seq.ing} {len(commits)} commit(s) on new branch {branch} (from origin/{target})")
         self.set_status(f"Creating {branch}…")
         self.run_bg(lambda: self.repo.new_branch(target, branch), lambda _: self.pick_next(),
                     lambda e: (self.end_picking(), self.error(e)))
@@ -929,10 +1037,10 @@ class Window(QMainWindow):
     def pick_next(self):
         if self.qi >= len(self.queue):
             return self.finish()
-        c = self.queue[self.qi]
-        self.set_status(f"Picking {self.qi + 1} of {len(self.queue)}: {c['short']} {c['subject']}")
-        record = self.x_cb.isChecked()
-        self.run_bg(lambda: self.repo.pick(c["sha"], record, c["merge"]), self.after_pick,
+        c, seq = self.queue[self.qi], self.cur
+        self.set_status(f"{seq.ing.capitalize()} {self.qi + 1} of {len(self.queue)}: {c['short']} {c['subject']}")
+        record = seq.record_cb is not None and seq.record_cb.isChecked()
+        self.run_bg(lambda: self.repo.pick(c["sha"], record, c["merge"], seq.op), self.after_pick,
                     lambda e: (self.finish(stopped=True), self.error(e)))
 
     def after_pick(self, result):
@@ -942,91 +1050,571 @@ class Window(QMainWindow):
             return
         self.stats[result].append(c)
         if result == "dropped":
-            self.log(f"{c['short']}: changes already present on target - nothing to commit, skipped")
+            self.log(f"{c['short']}: nothing left to change on the branch - nothing to commit, skipped")
         self.qi += 1
         self.pick_next()
 
     def show_conflict(self, files):
         self.conflict_files = files
-        c = self.queue[self.qi]
+        c, seq = self.queue[self.qi], self.cur
         self.set_status(f"Conflict in {c['short']}")
         esc = html.escape
         listing = "<br>".join(f"&nbsp;&nbsp;•&nbsp;<tt>{esc(f)}</tt>" for f in files)
-        self.conflict_msg.show_message(
+        seq.conflict_msg.show_message(
             "warning",
-            f"<b>Conflict while picking {c['short']} “{esc(c['subject'])}”</b> "
+            f"<b>Conflict while {seq.ing} {c['short']} “{esc(c['subject'])}”</b> "
             f"({self.qi + 1} of {len(self.queue)})<br>{listing}<br>"
-            "Resolve the conflicts and press <b>Continue</b>, or settle every file one way with "
-            "<i>Take Incoming</i> or <i>Keep Target</i>.")
-        self.continue_btn.setDefault(True)
-        self.continue_btn.setFocus()
+            f"Resolve the conflicts and press <b>Continue</b>, or settle every file one way with {seq.sides}.")
+        seq.continue_btn.setDefault(True)
+        seq.continue_btn.setFocus()
         if self.auto_editor_act.isChecked():
             self.open_conflicts_in_editor()
 
     def on_resolve(self, side):
-        self.run_bg(lambda: (self.repo.resolve_all(side), self.repo.continue_pick())[1], self.after_resolve)
+        repo, op = self.repo, self.cur.op
+        self.run_bg(lambda: (repo.resolve_all(side), repo.continue_pick(op))[1], self.after_resolve)
 
     def on_continue(self):
-        self.run_bg(self.repo.continue_pick, self.after_resolve)
+        repo, op = self.repo, self.cur.op
+        self.run_bg(lambda: repo.continue_pick(op), self.after_resolve)
 
     def after_resolve(self, result):
-        self.conflict_msg.hide()
+        self.cur.conflict_msg.hide()
         self.after_pick(result)
 
     def on_skip(self):
         def done(_):
-            self.conflict_msg.hide()
+            self.cur.conflict_msg.hide()
             self.stats["skipped"].append(self.queue[self.qi])
             self.qi += 1
             self.pick_next()
-        self.run_bg(self.repo.skip, done)
+        repo, op = self.repo, self.cur.op
+        self.run_bg(lambda: repo.skip(op), done)
 
     def on_stop(self):
-        self.run_bg(self.repo.abort, lambda _: self.finish(stopped=True))
+        repo, op = self.repo, self.cur.op
+        self.run_bg(lambda: repo.abort(op), lambda _: self.finish(stopped=True))
 
     def end_picking(self):
         self.picking = False
-        self.conflict_msg.hide()
+        if self.cur:
+            self.cur.conflict_msg.hide()
         self.update_sensitivity()
 
     def finish(self, stopped=False):
         self.end_picking()
+        seq = self.cur
         ok, dropped, skipped = self.stats["ok"], self.stats["dropped"], self.stats["skipped"]
-        parts = [f"<b>{len(ok)} commit{'s' if len(ok) != 1 else ''} picked</b> onto "
-                 f"<tt>{html.escape(self.last_branch)}</tt> (%STATE%)"]
+        parts = [f"<b>{len(ok)} commit{'s' if len(ok) != 1 else ''} {seq.ed}</b> on "
+                 f"<tt>{html.escape(seq.branch)}</tt> (%STATE%)"]
         if dropped:
-            parts.append(f"{len(dropped)} already present")
+            parts.append(f"{len(dropped)} with nothing to change")
         if skipped:
             parts.append(f"{len(skipped)} skipped")
         if stopped:
-            parts.append(f"stopped with {len(self.queue) - self.qi} not picked")
-        self.result_template = ", ".join(parts) + "."
+            parts.append(f"stopped with {len(self.queue) - self.qi} not {seq.ed}")
+        seq.template = ", ".join(parts) + "."
         kind = "positive" if ok and not stopped else "information"
-        self.result_msg.show_message(kind, self.result_template.replace("%STATE%", "local"))
+        seq.result_msg.show_message(kind, seq.template.replace("%STATE%", "local"))
         self.set_status("Stopped" if stopped else "Done")
-        self.push_btn.setVisible(bool(ok))
-        self.pr_btn.hide()
-        self.branch_auto = True
-        if ok and self.push_cb.isChecked():
-            self.on_push()
+        seq.push_btn.setVisible(bool(ok))
+        seq.pr_btn.hide()
+        seq.reset_branch_name()
+        if ok and seq.push_cb.isChecked():
+            self.on_push(seq)
 
-    def on_push(self):
-        branch = self.last_branch
+    def on_push(self, seq):
+        branch = seq.branch
         if not branch or not self.repo:
             return
+        repo = self.repo
         self.set_status(f"Pushing {branch}…")
 
         def done(_):
             self.set_status(f"Pushed {branch}")
-            self.result_msg.text.setText(self.result_template.replace("%STATE%", "pushed"))
-            self.push_btn.hide()
-            self.pr_btn.setVisible(self.repo.compare_url(self.last_target, branch) is not None)
-        self.run_bg(lambda: self.repo.push(branch), done)
+            seq.result_msg.text.setText(seq.template.replace("%STATE%", "pushed"))
+            seq.push_btn.hide()
+            seq.pr_btn.setVisible(repo.compare_url(seq.target, branch) is not None)
+        self.push_branch(repo, branch, None, done)
 
-    def on_open_pr(self):
-        url = self.repo and self.repo.compare_url(self.last_target, self.last_branch)
+    def push_branch(self, repo, branch, fork, done):
+        """Push; if the branch already exists there with other commits, ask before replacing it."""
+        def rejected(e):
+            if not isinstance(e, PushRejected):
+                return self.error(e)
+            where = fork or repo.slug or "the repository"
+            box = QMessageBox(QMessageBox.Icon.Question, "Replace Branch",
+                              f"“{branch}” already exists on {where} with different commits, "
+                              "probably from an earlier run.", parent=self)
+            box.setInformativeText("Replace it with the new branch? Its current commits are dropped from it, "
+                                   "and an open pull request from it will show the new ones instead.")
+            replace = box.addButton("Replace Branch", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() is not replace:
+                self.set_status(f"Not pushed: {branch} already exists on {where}")
+                return
+            self.set_status(f"Replacing {branch} on {where}…")
+            self.run_bg(lambda: repo.push(branch, fork, replace=True), done)
+        self.run_bg(lambda: repo.push(branch, fork), done, rejected)
+
+    def on_open_pr(self, seq):
+        url = self.repo and self.repo.compare_url(seq.target, seq.branch)
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+    # ------------------------------------------------------------ revert tab
+    def build_revert_tab(self, spacing):
+        tab = self.revert_tab = QWidget()
+        i = self.tabs.addTab(tab, icon("edit-undo", "document-revert"), "Revert")
+        self.tabs.setTabToolTip(i, "Undo chosen commits on a branch with new revert commits")
+        root = QVBoxLayout(tab)
+
+        row = QHBoxLayout()
+        lbl = QLabel("Revert on:")
+        row.addWidget(lbl)
+        self.r_branch_combo = searchable_combo()
+        self.r_branch_combo.setToolTip("Branch that has the commits you want to undo")
+        lbl.setBuddy(self.r_branch_combo)
+        self.r_branch_combo.activated.connect(lambda _i: self.load_reverts())
+        self.r_branch_combo.lineEdit().returnPressed.connect(self.load_reverts)
+        row.addWidget(self.r_branch_combo)
+        self.r_search = QLineEdit()
+        self.r_search.setPlaceholderText("Filter…")
+        self.r_search.setToolTip("Filter by message, author, hash or #PR (Ctrl+F)")
+        self.r_search.setClearButtonEnabled(True)
+        self.r_search.addAction(icon("search", "edit-find"), QLineEdit.ActionPosition.LeadingPosition)
+        self.r_search.textChanged.connect(lambda _t: self.r_apply_filter())
+        row.addWidget(self.r_search, 1)
+        row.addWidget(push_button("Deselect All", lambda: self.r_select_none(), "Clear the selection",
+                                  ("edit-select-none",)))
+        root.addLayout(row)
+
+        split = self.r_split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        self.r_stack = QStackedWidget()
+        self.r_placeholder = Placeholder()
+        self.r_stack.addWidget(self.r_placeholder)
+        self.r_tree = commit_tree(checkable=True)
+        self.r_tree.itemChanged.connect(lambda _it, col: col == COL_CHECK and self.r_selection_changed())
+        self.r_tree.itemActivated.connect(self.toggle_item)
+        self.r_tree.currentItemChanged.connect(lambda it, _p: self.show_diff(it, self.r_diff))
+        self.r_stack.addWidget(self.r_tree)
+        lv.addWidget(self.r_stack, 1)
+        self.r_count_lbl = QLabel()
+        self.r_count_lbl.setEnabled(False)
+        lv.addWidget(self.r_count_lbl)
+        split.addWidget(left)
+        self.r_diff = diff_view()
+        split.addWidget(self.r_diff)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        root.addWidget(split, 1)
+
+        seq = self.seq_revert = Sequence(op="revert", ing="reverting", ed="reverted", record_cb=None,
+                                         sides="<i>Take Revert</i> or <i>Keep Branch</i>",
+                                         reset_branch_name=lambda: setattr(self, "r_branch_auto", True))
+        m = seq.conflict_msg = MessageWidget("warning")
+        self.r_editor_btn = m.add_button(push_button("Open in Editor", self.open_conflicts_in_editor,
+                                                     "Open the conflicted files", ("document-edit",)))
+        m.add_button(push_button("Open Folder", self.open_folder, "Open the working copy in the file manager",
+                                 ("document-open-folder", "folder-open")))
+        m.add_button(push_button("Take Revert", lambda: self.on_resolve("theirs"),
+                                 "Resolve every conflicted file as the revert has it", ("go-previous",)))
+        m.add_button(push_button("Keep Branch", lambda: self.on_resolve("ours"),
+                                 "Resolve every conflicted file with the branch's current version",
+                                 ("go-next",)))
+        m.add_stretch()
+        m.add_button(push_button("Skip Commit", self.on_skip, "Leave this commit unreverted and go on",
+                                 ("media-skip-forward",)))
+        m.add_button(push_button("Stop", self.on_stop, "Abort this revert and stop; earlier reverts stay",
+                                 ("process-stop",)))
+        seq.continue_btn = m.add_button(push_button("Continue", self.on_continue,
+                                                    "Commit the resolved files and go on", ("dialog-ok-apply",)))
+        self.r_conflict_btns = message_buttons(m)
+        root.addWidget(m)
+        r = seq.result_msg = MessageWidget("positive", closable=True)
+        r.add_button(push_button("Open Folder", self.open_folder, icons=("document-open-folder", "folder-open")))
+        seq.push_btn = r.add_button(push_button("Push", lambda: self.on_push(self.seq_revert),
+                                                "Push the branch to GitHub", ("cloud-upload", "go-up")))
+        seq.pr_btn = r.add_button(push_button("Create Pull Request…", lambda: self.on_open_pr(self.seq_revert),
+                                              "Open GitHub to create the pull request",
+                                              ("vcs-merge-request", "internet-web-browser")))
+        r.add_stretch()
+        root.addWidget(r)
+
+        row = QHBoxLayout()
+        br_lbl = QLabel("New branch:")
+        row.addWidget(br_lbl)
+        self.r_branch_edit = QLineEdit()
+        self.r_branch_edit.setMinimumWidth(300)
+        self.r_branch_edit.setToolTip("Branch created from the chosen branch to hold the reverts")
+        self.r_branch_edit.textEdited.connect(lambda t: setattr(self, "r_branch_auto", not t.strip()))
+        br_lbl.setBuddy(self.r_branch_edit)
+        row.addWidget(self.r_branch_edit)
+        row.addSpacing(spacing * 2)
+        seq.push_cb = QCheckBox("Push when done")
+        seq.push_cb.setChecked(self.cfg.get("revert_push", False))
+        row.addWidget(seq.push_cb)
+        row.addStretch(1)
+        self.r_go_btn = push_button("Revert", self.on_revert, "Revert the selected commits (Ctrl+Return)",
+                                    ("edit-undo", "dialog-ok-apply"))
+        row.addWidget(self.r_go_btn)
+        root.addLayout(row)
+        self.set_r_placeholder()
+
+    def r_items(self):
+        return [self.r_tree.topLevelItem(i) for i in range(self.r_tree.topLevelItemCount())]
+
+    def r_selected(self):
+        return [it.commit for it in self.r_items() if it.checkState(COL_CHECK) == Qt.CheckState.Checked]
+
+    def set_r_placeholder(self, icons=("vcs-branch", "folder-git", "git"), title="No repository loaded",
+                          explanation="Enter a GitHub repository above and press Load."):
+        self.r_placeholder.set(icons, title, explanation)
+        self.r_stack.setCurrentWidget(self.r_placeholder)
+
+    def clear_reverts(self):
+        self.r_tree.clear()
+        self.r_diff.clear()
+        self.r_selection_changed()
+
+    def r_selection_changed(self):
+        sel = self.r_selected()
+        n, items = len(sel), self.r_items()
+        hidden = sum(it.isHidden() for it in items)
+        txt = f"{len(items)} commits" if items else ""
+        if hidden:
+            txt += f", {hidden} hidden"
+        if len(items) >= COMMIT_LIMIT:
+            txt += f" (newest {COMMIT_LIMIT} shown)"
+        if n:
+            txt += f" · {n} selected"
+        self.r_count_lbl.setText(txt)
+        self.r_go_btn.setText(f"Revert {n} Commit{'s' if n != 1 else ''}" if n else "Revert")
+        branch = self.r_branch_combo.currentText().strip()
+        if self.r_branch_auto and branch:
+            self.r_branch_edit.setText(revert_branch_name(branch, sel))
+        self.update_sensitivity()
+
+    def r_apply_filter(self):
+        q = self.r_search.text().strip().lower()
+        for it in self.r_items():
+            c = it.commit
+            pr = pr_from_subject(c["subject"])
+            it.setHidden(bool(q) and not (q in c["subject"].lower() or q in c["author"].lower()
+                                          or c["sha"].startswith(q) or (pr is not None and q.lstrip("#") == str(pr))))
+        self.r_selection_changed()
+
+    def r_select_none(self):
+        self.r_tree.blockSignals(True)
+        for it in self.r_items():
+            it.setCheckState(COL_CHECK, Qt.CheckState.Unchecked)
+        self.r_tree.blockSignals(False)
+        self.r_tree.viewport().update()
+        self.r_selection_changed()
+
+    def load_reverts(self):
+        if not self.repo:
+            return
+        branch = self.r_branch_combo.currentText().strip()
+        if branch not in [self.r_branch_combo.itemText(i) for i in range(self.r_branch_combo.count())]:
+            return
+        self.r_branch_auto = True
+        self.clear_reverts()
+        self.cfg.setdefault("repos", {}).setdefault(self.repo.spec, {})["revert"] = {"branch": branch}
+        save_config(self.cfg)
+        self.set_r_placeholder(("view-history", "document-open-recent"), "Loading commits…", "")
+        repo = self.repo
+
+        def done(commits):
+            if self.r_branch_combo.currentText().strip() != branch or repo is not self.repo:
+                return
+            self.r_tree.blockSignals(True)
+            for c in commits:
+                self.r_tree.addTopLevelItem(commit_item(c, checkable=True))
+            self.r_tree.blockSignals(False)
+            self.r_apply_filter()
+            if commits:
+                self.r_stack.setCurrentWidget(self.r_tree)
+            else:
+                self.set_r_placeholder(("dialog-information",), "No commits on this branch", "")
+        self.run_bg(lambda: repo.branch_commits(branch), done,
+                    lambda e: (self.set_r_placeholder(("dialog-error",), "Could not list commits", ""), self.error(e)))
+
+    def on_revert(self):
+        commits = self.r_selected()  # newest first, which is the order to undo them in
+        if not commits or not self.repo or self.busy or self.picking:
+            return
+        branch = self.r_branch_combo.currentText().strip()
+        new = self.r_branch_edit.text().strip() or revert_branch_name(branch, commits)
+        self.cfg["revert_push"] = self.seq_revert.push_cb.isChecked()
+        save_config(self.cfg)
+        self.start_sequence(self.seq_revert, commits, branch, new)
+
+    # ------------------------------------------------------------ rebase PR tab
+    def build_rebase_tab(self):
+        tab = self.rebase_tab = QWidget()
+        i = self.tabs.addTab(tab, icon("vcs-pull", "go-up", "view-refresh"), "Rebase PR")
+        self.tabs.setTabToolTip(i, "Rebase a pull request onto the latest version of its base branch")
+        root = QVBoxLayout(tab)
+
+        row = QHBoxLayout()
+        lbl = QLabel("Pull request:")
+        row.addWidget(lbl)
+        self.b_pr_edit = QLineEdit()
+        self.b_pr_edit.setPlaceholderText("123, #123 or its GitHub URL")
+        self.b_pr_edit.setMinimumWidth(240)
+        self.b_pr_edit.returnPressed.connect(self.on_rebase_lookup)
+        lbl.setBuddy(self.b_pr_edit)
+        row.addWidget(self.b_pr_edit)
+        self.b_lookup_btn = push_button("Look Up", self.on_rebase_lookup, "Fetch the pull request and its commits",
+                                        ("edit-find", "search"))
+        row.addWidget(self.b_lookup_btn)
+        row.addStretch(1)
+        root.addLayout(row)
+        self.b_info = QLabel()
+        self.b_info.setWordWrap(True)
+        self.b_info.setTextFormat(Qt.TextFormat.RichText)
+        self.b_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.b_info.setOpenExternalLinks(True)
+        self.b_info.hide()
+        root.addWidget(self.b_info)
+        self.b_note = MessageWidget("information")
+        root.addWidget(self.b_note)
+
+        split = self.b_split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+        self.b_stack = QStackedWidget()
+        self.b_placeholder = Placeholder()
+        self.b_stack.addWidget(self.b_placeholder)
+        self.b_tree = commit_tree(checkable=False)
+        self.b_tree.currentItemChanged.connect(lambda it, _p: self.show_diff(it, self.b_diff))
+        self.b_stack.addWidget(self.b_tree)
+        split.addWidget(self.b_stack)
+        self.b_diff = diff_view()
+        split.addWidget(self.b_diff)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        root.addWidget(split, 1)
+
+        m = self.b_conflict_msg = MessageWidget("warning")
+        self.b_editor_btn = m.add_button(push_button("Open in Editor", self.open_conflicts_in_editor,
+                                                     "Open the conflicted files", ("document-edit",)))
+        m.add_button(push_button("Open Folder", self.open_folder, "Open the working copy in the file manager",
+                                 ("document-open-folder", "folder-open")))
+        m.add_button(push_button("Take PR Version", lambda: self.on_rebase_resolve("theirs"),
+                                 "Resolve every conflicted file with the pull request's version", ("go-next",)))
+        m.add_button(push_button("Keep Base", lambda: self.on_rebase_resolve("ours"),
+                                 "Resolve every conflicted file with the base branch version", ("go-previous",)))
+        m.add_stretch()
+        m.add_button(push_button("Skip Commit", lambda: self.rebase_cmd(lambda r: r.rebase_skip()),
+                                 "Drop this commit from the pull request and go on", ("media-skip-forward",)))
+        m.add_button(push_button("Abort Rebase", self.on_rebase_abort, "Give up and leave the pull request as it is",
+                                 ("process-stop",)))
+        self.b_continue_btn = m.add_button(push_button("Continue", lambda: self.rebase_cmd(lambda r: r.rebase_continue()),
+                                                       "Commit the resolved files and go on", ("dialog-ok-apply",)))
+        self.b_conflict_btns = message_buttons(m)
+        root.addWidget(m)
+        r = self.b_result_msg = MessageWidget("positive", closable=True)
+        r.add_button(push_button("Open Folder", self.open_folder, icons=("document-open-folder", "folder-open")))
+        self.b_push_btn = r.add_button(push_button("Force Push", self.on_rebase_push,
+                                                   "Replace the pull request's commits with the rebased ones",
+                                                   ("cloud-upload", "go-up")))
+        r.add_button(push_button("Open Pull Request", self.on_rebase_open, icons=("internet-web-browser",)))
+        r.add_stretch()
+        root.addWidget(r)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.b_go_btn = push_button("Rebase", self.on_rebase, "Rebase the pull request onto its base (Ctrl+Return)",
+                                    ("vcs-pull", "go-up", "dialog-ok-apply"))
+        row.addWidget(self.b_go_btn)
+        root.addLayout(row)
+        self.reset_rebase_view()
+
+    def clear_rebase(self):
+        self.reset_rebase_view()
+        self.update_sensitivity()
+
+    def reset_rebase_view(self):
+        self.b_pr = None
+        self.b_tree.clear()
+        self.b_diff.clear()
+        self.b_info.hide()
+        self.b_note.hide()
+        self.b_result_msg.hide()
+        self.b_go_btn.setText("Rebase")
+        self.b_placeholder.set(("vcs-merge-request", "vcs-pull"), "No pull request",
+                               "Enter a pull request number above and press Look Up.")
+        self.b_stack.setCurrentWidget(self.b_placeholder)
+
+    def b_can_push(self):
+        pr = self.b_pr
+        return bool(pr) and (pr["same_repo"] or (pr["can_modify"] and pr["head_repo"] is not None))
+
+    def on_rebase_lookup(self):
+        if not self.repo or self.busy or self.picking:
+            return
+        try:
+            n = parse_pr(self.b_pr_edit.text())
+        except GitError as e:
+            return self.error(e)
+        self.clear_rebase()
+        self.error_msg.hide()
+        self.b_placeholder.set(("view-history", "document-open-recent"), f"Looking up #{n}…", "")
+        self.set_status(f"Fetching pull request #{n}…")
+        repo = self.repo
+        self.run_bg(lambda: repo.pr_info(n), self.show_pr_info,
+                    lambda e: (self.clear_rebase(), self.set_status(""), self.error(e)))
+
+    def show_pr_info(self, pr):
+        self.b_pr = pr
+        esc = html.escape
+        head = f"{pr['head_repo'] or '(deleted fork)'}:{pr['head']}"
+        n = len(pr["commits"])
+        self.b_info.setText(
+            f"<b><a href=\"{esc(pr['url'])}\">#{pr['number']}</a> {esc(pr['title'])}</b>"
+            f"{' (draft)' if pr['draft'] else ''}<br>"
+            f"by {esc(pr['author'])} · <tt>{esc(head)}</tt> → <tt>{esc(pr['base'])}</tt> · "
+            f"{n} commit{'s' if n != 1 else ''} · {pr['behind']} commit{'s' if pr['behind'] != 1 else ''} "
+            f"behind {esc(pr['base'])}")
+        self.b_info.show()
+        notes = []
+        kind = "information"
+        if pr["state"] != "open":
+            notes.append(f"This pull request is {pr['state']}.")
+            kind = "warning"
+        elif pr["behind"] == 0:
+            notes.append(f"It is already up to date with {esc(pr['base'])}; there is nothing to rebase.")
+        if not self.b_can_push():
+            kind = "warning"
+            notes.append("You can rebase it here, but not push it back: "
+                         + ("its fork has been deleted." if pr["head_repo"] is None else
+                            "it comes from a fork whose author hasn't allowed edits from maintainers. "
+                            "Ask them to tick “Allow edits from maintainers”, or to rebase it themselves."))
+        if notes:
+            self.b_note.show_message(kind, " ".join(notes))
+        for c in pr["commits"]:
+            self.b_tree.addTopLevelItem(commit_item(c, checkable=False))
+        self.b_stack.setCurrentWidget(self.b_tree)
+        self.b_go_btn.setText(f"Rebase onto {pr['base']}")
+        self.set_status(f"#{pr['number']}: {n} commits, {pr['behind']} behind {pr['base']}")
+        self.update_sensitivity()
+
+    def on_rebase(self):
+        pr, repo = self.b_pr, self.repo
+        if not pr or not repo or self.busy or self.picking or not self.b_go_btn.isEnabled():
+            return
+        self.picking = True
+        self.b_result_msg.hide()
+        self.error_msg.hide()
+        self.log(f"--- rebasing #{pr['number']} ({pr['head']}) onto origin/{pr['base']}")
+        self.set_status(f"Rebasing #{pr['number']} onto {pr['base']}…")
+        self.run_bg(lambda: repo.start_rebase(pr), self.after_rebase,
+                    lambda e: (self.end_picking(), self.error(e)))
+
+    def rebase_cmd(self, fn):
+        repo = self.repo
+        self.run_bg(lambda: fn(repo), self.after_rebase)
+
+    def on_rebase_resolve(self, side):
+        self.rebase_cmd(lambda r: (r.resolve_all(side), r.rebase_continue())[1])
+
+    def after_rebase(self, result):
+        if result == "conflict":
+            repo = self.repo
+            self.run_bg(lambda: (repo.conflicts(), repo.rebase_step()), self.show_rebase_conflict)
+        else:
+            self.finish_rebase(result)
+
+    def show_rebase_conflict(self, res):
+        files, (pos, total, short, subject) = res
+        self.conflict_files = files
+        esc = html.escape
+        self.set_status(f"Conflict in {short}")
+        listing = "<br>".join(f"&nbsp;&nbsp;•&nbsp;<tt>{esc(f)}</tt>" for f in files)
+        step = f" ({pos} of {total})" if total else ""
+        self.b_conflict_msg.show_message(
+            "warning",
+            f"<b>Conflict while rebasing {esc(short)} “{esc(subject)}”</b>{step}<br>{listing}<br>"
+            "Resolve the conflicts and press <b>Continue</b>, or settle every file one way with "
+            "<i>Take PR Version</i> or <i>Keep Base</i>.")
+        self.b_continue_btn.setDefault(True)
+        self.b_continue_btn.setFocus()
+        if self.auto_editor_act.isChecked():
+            self.open_conflicts_in_editor()
+
+    def on_rebase_abort(self):
+        def done(_):
+            self.end_picking()
+            self.b_conflict_msg.hide()
+            self.b_result_msg.show_message("information", "Rebase aborted. The pull request is unchanged.")
+            self.b_push_btn.hide()
+            self.set_status("Rebase aborted")
+        repo = self.repo
+        self.run_bg(repo.rebase_abort, done)
+
+    def finish_rebase(self, result):
+        self.end_picking()
+        self.b_conflict_msg.hide()
+        pr, esc = self.b_pr, html.escape
+        if result == "uptodate":
+            self.b_result_msg.show_message("information", f"Nothing to do: #{pr['number']} is already based on the "
+                                                          f"latest {esc(pr['base'])}.")
+            self.b_push_btn.hide()
+            self.set_status("Already up to date")
+            return
+        self.b_result_msg.show_message(
+            "positive", f"<b>Rebased #{pr['number']}</b> onto the latest <tt>{esc(pr['base'])}</tt> (local)."
+            + ("" if self.b_can_push() else " It can't be pushed back to the pull request (see above)."))
+        self.b_push_btn.setText(f"Force Push to {pr['head']}")
+        self.b_push_btn.setVisible(self.b_can_push())
+        self.set_status("Rebased")
+
+    def on_rebase_push(self):
+        pr, repo = self.b_pr, self.repo
+        if not pr or not repo:
+            return
+        where = f"{pr['head_repo']}:{pr['head']}"
+        answer = QMessageBox.question(
+            self, "Force Push",
+            f"Replace the commits of pull request #{pr['number']} with the rebased ones?\n\n"
+            f"This force-pushes to {where}. It is refused if anyone pushed to the pull request "
+            "after you looked it up.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.set_status(f"Force-pushing to {where}…")
+
+        def done(_):
+            self.set_status(f"Pushed #{pr['number']}")
+            self.b_result_msg.text.setText(f"<b>Rebased #{pr['number']}</b> onto the latest "
+                                           f"<tt>{html.escape(pr['base'])}</tt> and pushed.")
+            self.b_push_btn.hide()
+        self.run_bg(lambda: repo.push_pr(pr), done)
+
+    def on_rebase_open(self):
+        if self.b_pr:
+            QDesktopServices.openUrl(QUrl(self.b_pr["url"]))
+
+    # ------------------------------------------------------------ shared commit view helpers
+    def show_diff(self, item, view):
+        if item is None or not self.repo:
+            return
+        self.diff_req += 1
+        req, repo, sha = self.diff_req, self.repo, item.commit["sha"]
+
+        def work():
+            try:
+                text = repo.show(sha)
+            except GitError as e:
+                text = str(e)
+            self.bridge.call.emit(lambda: req == self.diff_req and view.setPlainText(text))
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ promote tab
     def build_promote_tab(self, spacing):
@@ -1337,7 +1925,7 @@ class Window(QMainWindow):
             self.p_result_msg.text.setText(self.p_result_template.replace("%STATE%", state))
             self.p_push_btn.hide()
             self.p_pr_btn.setVisible(repo.compare_url(p["target"], p["branch"], p["fork"]) is not None)
-        self.run_bg(lambda: repo.push(p["branch"], p["fork"] or None), done)
+        self.push_branch(repo, p["branch"], p["fork"] or None, done)
 
     def on_promote_pr(self):
         p = self.p_last

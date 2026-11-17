@@ -10,6 +10,15 @@ It lists the commits the merge would bring in, then fetches, creates `promote-ma
 from the target, merges, helps you through conflicts, and pushes the branch to the repository or
 to your fork (*Push to fork*, e.g. `you/repo`) before opening the pull request page.
 
+The **Revert** tab lists what landed on a branch (one row per merged change) and undoes the ones
+you tick on a new branch such as `revert-123-on-main`, with the same conflict help, push and
+pull request steps.
+
+The **Rebase PR** tab handles "can you rebase this PR?": enter the PR number, and it fetches the PR,
+rebases it onto the latest base branch, helps you through conflicts, then force-pushes it back to
+the PR's branch. The push uses `--force-with-lease`, so it is refused if the author pushed in the
+meantime. Pushing to a PR from a fork needs "Allow edits from maintainers" ticked on the PR.
+
 The repository is cloned into `~/.cache/cherry-picker/`, so your own checkouts are never touched.
 
 ## Install
