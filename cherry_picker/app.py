@@ -1368,6 +1368,8 @@ class Window(QMainWindow):
         row.addWidget(lbl)
         self.b_pr_edit = QLineEdit()
         self.b_pr_edit.setPlaceholderText("123, #123 or its GitHub URL")
+        self.b_pr_edit.setToolTip("Pull request number. If the loaded repository is a fork, the pull request "
+                                  "is also looked for in the repository it was forked from.")
         self.b_pr_edit.setMinimumWidth(240)
         self.b_pr_edit.returnPressed.connect(self.on_rebase_lookup)
         lbl.setBuddy(self.b_pr_edit)
@@ -1461,7 +1463,7 @@ class Window(QMainWindow):
         if not self.repo or self.busy or self.picking:
             return
         try:
-            n = parse_pr(self.b_pr_edit.text())
+            slug, n = parse_pr(self.b_pr_edit.text())
         except GitError as e:
             return self.error(e)
         self.clear_rebase()
@@ -1469,7 +1471,7 @@ class Window(QMainWindow):
         self.b_placeholder.set(("view-history", "document-open-recent"), f"Looking up #{n}…", "")
         self.set_status(f"Fetching pull request #{n}…")
         repo = self.repo
-        self.run_bg(lambda: repo.pr_info(n), self.show_pr_info,
+        self.run_bg(lambda: repo.pr_info(n, slug), self.show_pr_info,
                     lambda e: (self.clear_rebase(), self.set_status(""), self.error(e)))
 
     def show_pr_info(self, pr):
@@ -1480,7 +1482,7 @@ class Window(QMainWindow):
         self.b_info.setText(
             f"<b><a href=\"{esc(pr['url'])}\">#{pr['number']}</a> {esc(pr['title'])}</b>"
             f"{' (draft)' if pr['draft'] else ''}<br>"
-            f"by {esc(pr['author'])} · <tt>{esc(head)}</tt> → <tt>{esc(pr['base'])}</tt> · "
+            f"by {esc(pr['author'])} · <tt>{esc(head)}</tt> → <tt>{esc(pr['base_repo'])}:{esc(pr['base'])}</tt> · "
             f"{n} commit{'s' if n != 1 else ''} · {pr['behind']} commit{'s' if pr['behind'] != 1 else ''} "
             f"behind {esc(pr['base'])}")
         self.b_info.show()

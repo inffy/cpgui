@@ -90,11 +90,12 @@ def github_api(path):
 
 
 def parse_pr(text):
-    """123, #123 or a .../pull/123 URL -> 123."""
-    m = re.fullmatch(r"\s*(?:#?(\d+)|https?://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)\S*)\s*", text)
+    """123, #123, owner/repo#123 or a .../owner/repo/pull/123 URL -> (owner/repo or None, 123)."""
+    m = re.fullmatch(r"\s*(?:([\w.-]+/[\w.-]+))?#?(\d+)\s*", text) or \
+        re.fullmatch(r"\s*https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)\S*\s*", text)
     if not m:
-        raise GitError("Enter a pull request number (e.g. 123 or #123) or its GitHub URL.")
-    return int(m.group(1) or m.group(2))
+        raise GitError("Enter a pull request number (e.g. 123 or #123), owner/repo#123 or its GitHub URL.")
+    return m.group(1), int(m.group(2))
 
 
 def revert_branch_name(branch, commits, now=None):
@@ -313,13 +314,46 @@ class Repo:
         return self.log_commits("--first-parent", f"origin/{branch}")
 
     # -- rebasing a pull request onto its base
-    def pr_info(self, number):
+    def _github_url(self, slug):
+        """Clone URL of another GitHub repository, in the same style (SSH or https) as this one."""
+        return f"git@github.com:{slug}.git" if self.url.startswith("git@") else f"https://github.com/{slug}.git"
+
+    def _find_pr(self, number, slug=None):
+        """(repository the PR lives in, API data). Without `slug`, looks here, then in the parent if this
+        is a fork (PRs from your fork are opened on the upstream repository)."""
+        candidates = [slug] if slug else [self.slug]
+        if not slug:
+            try:
+                parent = (github_api(f"repos/{self.slug}").get("parent") or {}).get("full_name")
+            except GitError:
+                parent = None
+            if parent:
+                candidates.append(parent)
+        for repo in candidates:
+            try:
+                data = github_api(f"repos/{repo}/pulls/{number}")
+            except GitError as e:
+                if "404" in str(e) or "Not Found" in str(e):
+                    continue
+                raise
+            if isinstance(data, dict) and "head" in data:
+                return repo, data
+        raise GitError(f"Could not find pull request #{number} in {' or '.join(candidates)}.")
+
+    def _fetch_pr_refs(self, info):
+        """Fetch the PR head into refs/pr/<n> and its base branch into refs/pr-base/<n>."""
+        n = info["number"]
+        url = self._github_url(info["base_repo"])
+        use_gh = url.startswith("https://github.com/") and gh_authenticated()
+        self.run(["fetch", "--no-tags", url, f"+refs/pull/{n}/head:refs/pr/{n}",
+                  f"+refs/heads/{info['base']}:refs/pr-base/{n}"], use_gh=use_gh)
+        return self.out(["rev-parse", f"refs/pr/{n}"]).strip()
+
+    def pr_info(self, number, slug=None):
         """The pull request from the GitHub API, plus its commits fetched into refs/pr/<number>."""
         if not self.slug:
             raise GitError("Rebasing a pull request needs a GitHub repository (owner/repo).")
-        data = github_api(f"repos/{self.slug}/pulls/{number}")
-        if not isinstance(data, dict) or "head" not in data:
-            raise GitError(f"Could not find pull request #{number} in {self.slug}.")
+        base_repo, data = self._find_pr(number, slug)
         head_repo = data["head"].get("repo") or {}
         info = dict(number=number, title=data.get("title", ""), author=(data.get("user") or {}).get("login", "?"),
                     state="merged" if data.get("merged_at") else data.get("state", "open"),
@@ -327,23 +361,25 @@ class Repo:
                     head_sha=data["head"]["sha"], head_repo=head_repo.get("full_name"),
                     head_ssh=head_repo.get("ssh_url"), head_https=head_repo.get("clone_url"),
                     can_modify=bool(data.get("maintainer_can_modify")),
-                    url=data.get("html_url") or f"https://github.com/{self.slug}/pull/{number}")
+                    url=data.get("html_url") or f"https://github.com/{base_repo}/pull/{number}",
+                    base_repo=base_repo)
+        # the head branch lives in the loaded repository (e.g. your fork): push through origin
         info["same_repo"] = (info["head_repo"] or "").lower() == self.slug.lower()
-        self.fetch()
-        self.run(["fetch", "--no-tags", "origin", f"+refs/pull/{number}/head:refs/pr/{number}"])
-        info["fetched_sha"] = self.out(["rev-parse", f"refs/pr/{number}"]).strip()
-        rng = f"origin/{info['base']}..refs/pr/{number}"
-        info["commits"] = self.log_commits("--topo-order", rng)
-        info["behind"] = int(self.out(["rev-list", "--count", f"refs/pr/{number}..origin/{info['base']}"]).strip())
+        info["fetched_sha"] = self._fetch_pr_refs(info)
+        info["commits"] = self.log_commits("--topo-order", f"refs/pr-base/{number}..refs/pr/{number}")
+        info["behind"] = int(self.out(["rev-list", "--count", f"refs/pr/{number}..refs/pr-base/{number}"]).strip())
         return info
 
     def start_rebase(self, info):
-        """Check out the PR head and rebase it onto origin/<base>: "ok", "uptodate" or "conflict"."""
+        """Check out the PR head and rebase it onto the latest base: "ok", "uptodate" or "conflict"."""
         self.abort_unfinished()
-        branch = f"pr-{info['number']}"
-        self.run(["checkout", "-f", "-B", branch, f"refs/pr/{info['number']}"])
+        n = info["number"]
+        if self._fetch_pr_refs(info) != info["fetched_sha"]:
+            raise GitError(f"Pull request #{n} has changed since you looked it up. Press Look Up again.")
+        branch = f"pr-{n}"
+        self.run(["checkout", "-f", "-B", branch, f"refs/pr/{n}"])
         self.run(["clean", "-fdq"])
-        base = f"origin/{info['base']}"
+        base = f"refs/pr-base/{n}"
         if self.run(["merge-base", "--is-ancestor", base, "HEAD"], check=False, quiet=True).returncode == 0:
             return "uptodate"
         p = self.run(["rebase", base], check=False)
